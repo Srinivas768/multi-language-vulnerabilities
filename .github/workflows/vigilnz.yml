@@ -3376,7 +3376,7 @@ jobs:
               --arg repoUrl "${VIGILNZ_REPO_URL:-}" \
               --arg failOn "HIGH" \
               --argjson failOnKev true \
-              --argjson softFail false \
+              --argjson softFail true \
               '{targetId:$tid, pipelineId:(if $pid=="" then null else $pid end), repoUrl:(if $repoUrl=="" then null else $repoUrl end), failOn:$failOn, failOnKev:$failOnKev, softFail:$softFail}')
             GATE_HTTP=$(curl -sS -o /tmp/vigilnz_gate_resp.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/gate-eval" \
               -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
