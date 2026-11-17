@@ -2,12 +2,19 @@
 # Secret VIGILNZ_API_KEY = Vigilnz product API key (vigil_…).
 # Secret PLATFORM_NODE_BROKER_URL = Platform Node broker (never the Backend URL).
 # Auto-fix + vuln breakdown use the shared runner (same as Harness/Jenkins).
-# When to run: push — branches: main
+# When to run: push, pull_request, release, schedule, manual — branches: main — daily 0 2 * * * UTC
 # Job timeout: 360 minutes.
-name: "Auto-Pilot-Test"
+name: "Full-workflow"
 on:
   push:
     branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  release:
+    types: [published]
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -18,13 +25,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
-      - name: "Auto-Pilot-Test"
+      - name: "Full-workflow"
         env:
           VIGILNZ_API_KEY: ${{ secrets.VIGILNZ_API_KEY }}
           PLATFORM_NODE_BROKER_URL: ${{ secrets.PLATFORM_NODE_BROKER_URL }}
           VIGILNZ_REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
           VIGILNZ_PROJECT_NAME: ${{ github.repository }}
-          VIGILNZ_PIPELINE_ID: "6afbeedaafc2ca6d18b37bd9"
+          VIGILNZ_PIPELINE_ID: "6afbf404afc2ca6d18b37bf6"
           VIGILNZ_BRANCH: ${{ github.ref_name }}
           VIGILNZ_COMMIT_SHA: ${{ github.sha }}
         run: |
@@ -33,8 +40,458 @@ jobs:
           # Auto-fix: Mongo scanResultId + remediation.json (message, keptFixes, needsHuman) for Autopilot UI.
           # Recommended: set CI job timeout >= 60m when waitForCompletion is enabled.
           
-          # --- SCA scan ---
-          #!/usr/bin/env bash
+          # --- Parallel 1 ---
+          set -euo pipefail
+          set +x
+          : "${VIGILNZ_STATE_DIR:=/tmp/vigilnz_ci}"
+          mkdir -p "${VIGILNZ_STATE_DIR}" "/tmp/vigilnz_ci"
+          command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
+          if ! command -v jq >/dev/null 2>&1; then
+            JQ_BIN="/tmp/vigilnz_ci/jq"
+            if [ ! -x "$JQ_BIN" ]; then
+              curl -fsSL -o "$JQ_BIN" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 \
+                || curl -fsSL -o "$JQ_BIN" https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+              chmod +x "$JQ_BIN"
+            fi
+            export PATH="/tmp/vigilnz_ci:$PATH"
+          fi
+          command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+          
+          # Contact Backend only through the Platform Node broker (/backend/*).
+          # One broker session + one API auth per pipeline run (reuse via VIGILNZ_AUTH_READY).
+          vigilnz_first_http_url() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                http://*|https://*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          vigilnz_first_api_key() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                vigil_*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          PLATFORM_NODE_BROKER_URL="$(vigilnz_first_http_url   "${PLATFORM_NODE_BROKER_URL:-}"   "${VIGILNZ_BROKER_URL:-}"   "${vigilnz_broker_url:-}"   "${VIGILNZ_API_URL:-}" || true)"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/}"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/backend}"
+          VIGILNZ_API_KEY="$(vigilnz_first_api_key "${VIGILNZ_API_KEY:-}" "${vigilnz_api_key:-}" || true)"
+          case "${VIGILNZ_REPO_URL:-}" in ''|null|NULL|undefined) VIGILNZ_REPO_URL= ;; esac
+          case "${VIGILNZ_BRANCH:-}" in ''|null|NULL|undefined) VIGILNZ_BRANCH= ;; esac
+          VIGILNZ_REPO_URL="${VIGILNZ_REPO_URL:?Set VIGILNZ_REPO_URL to the git clone URL selected in Autopilot}"
+          VIGILNZ_PROJECT_NAME="${VIGILNZ_PROJECT_NAME:-vigilnz-ci}"
+          
+          if [ -z "$PLATFORM_NODE_BROKER_URL" ]; then
+            echo "PLATFORM_NODE_BROKER_URL must be an http(s) broker URL (never Backend, never a worker token)." >&2
+            echo "Harness: Secret Text identifier vigilnz_broker_url, bound to pipeline variable PLATFORM_NODE_BROKER_URL." >&2
+            echo "Jenkins: environment { PLATFORM_NODE_BROKER_URL = credentials('vigilnz-broker-url') } (Secret text, never Backend)." >&2
+            exit 1
+          fi
+          if [ -z "$VIGILNZ_API_KEY" ]; then
+            echo "VIGILNZ_API_KEY must start with vigil_ (Settings → API keys)." >&2
+            echo "Harness secret identifier: vigilnz_api_key. Jenkins credential id: vigilnz-api-key." >&2
+            echo "Do not use a worker node token (vwn_live_…) or a node id." >&2
+            exit 1
+          fi
+          export PLATFORM_NODE_BROKER_URL VIGILNZ_API_KEY
+          export VIGILNZ_BACKEND_URL="${PLATFORM_NODE_BROKER_URL}/backend"
+          mkdir -p "/tmp/vigilnz_ci" "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}"
+          
+          echo "PLATFORM_NODE_BROKER_URL=${PLATFORM_NODE_BROKER_URL}"
+          echo "VIGILNZ_REPO_URL=${VIGILNZ_REPO_URL}"
+          echo "VIGILNZ_PROJECT_NAME=${VIGILNZ_PROJECT_NAME}"
+          
+          vigilnz_mint_broker_session() {
+            local session_body session_http session_resp
+            session_body=$(jq -n --arg token "$VIGILNZ_API_KEY" '{token:$token}')
+            session_http=$(curl -sS -o /tmp/vigilnz_broker_session.json -w "%{http_code}" -X POST "${PLATFORM_NODE_BROKER_URL}/v1/session" \
+              -H "Content-Type: application/json" \
+              -d "$session_body" || true)
+            session_resp=$(cat /tmp/vigilnz_broker_session.json 2>/dev/null || true)
+            echo "Broker session HTTP ${session_http}"
+            if [ "$session_http" != "200" ]; then
+              echo "Broker session failed (${session_http}). Use PLATFORM_NODE_BROKER_URL, not the Backend URL. Body:" >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_BROKER_SESSION=$(echo "$session_resp" | jq -r '.sessionToken // empty')
+            if [ -z "$VIGILNZ_BROKER_SESSION" ] || [ "$VIGILNZ_BROKER_SESSION" = "null" ]; then
+              echo "Broker session JSON missing sessionToken." >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            export VIGILNZ_BROKER_SESSION
+          }
+          
+          vigilnz_api_key_auth() {
+            local auth_http auth_resp
+            AUTH_HTTP=$(curl -sS -o /tmp/vigilnz_auth.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/auth/api-key" \
+              -H "Content-Type: application/json" \
+              -H "X-Api-Key: ${VIGILNZ_API_KEY}" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "{}" || true)
+            AUTH_RESP=$(cat /tmp/vigilnz_auth.json 2>/dev/null || true)
+            echo "Auth HTTP ${AUTH_HTTP}"
+            if [ "$AUTH_HTTP" != "200" ]; then
+              echo "API key auth HTTP failed (${AUTH_HTTP}). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_TOKEN=$(echo "$AUTH_RESP" | jq -r '.access_token // .token // .data.access_token // empty')
+            if [ -z "$VIGILNZ_TOKEN" ] || [ "$VIGILNZ_TOKEN" = "null" ]; then
+              echo "API key auth failed (no token in JSON). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_TOKEN
+          }
+          
+          # One authorization per pipeline: reuse env, then AUTH_READY state files, else mint once.
+          if [ -n "${VIGILNZ_BROKER_SESSION:-}" ] && [ -n "${VIGILNZ_TOKEN:-}" ]; then
+            echo "Reusing broker session and API token for this pipeline run"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          elif [ "${VIGILNZ_AUTH_READY:-}" = "1" ] \
+            && [ -s /tmp/vigilnz_ci/broker_session ] \
+            && [ -s /tmp/vigilnz_ci/token ]; then
+            VIGILNZ_BROKER_SESSION=$(cat /tmp/vigilnz_ci/broker_session)
+            VIGILNZ_TOKEN=$(cat /tmp/vigilnz_ci/token)
+            echo "Reusing broker session and API token from pipeline state"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          else
+            # Fresh mint — do not load leftover /tmp files from a prior CI build on the agent.
+            vigilnz_mint_broker_session || exit 1
+            vigilnz_api_key_auth || exit 1
+          fi
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          
+          
+          vigilnz_run_id() {
+            # Strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            printf '%s' "$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id 2>/dev/null || true)" | tr -d '\r\n' | sed 's/^-n //'
+          }
+          
+          vigilnz_broker_backend_ok() {
+            case "${VIGILNZ_BACKEND_URL:-}" in
+              http://*|https://*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          
+          # ObjectId / UUID-like tokens only — spaces or "-n " prefixes break curl URLs.
+          vigilnz_run_id_ok() {
+            case "$1" in
+              ''|null|NULL) return 1 ;;
+              *[!A-Za-z0-9_-]*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          
+          vigilnz_run_start() {
+            local pid repo branch sha body http resp rid
+            pid="${VIGILNZ_PIPELINE_ID:-}"
+            if [ -z "$pid" ]; then
+              echo "Autopilot run start skipped — VIGILNZ_PIPELINE_ID unset (re-download Jenkinsfile after Autopilot Save)" >&2
+              return 0
+            fi
+            if [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ]; then
+              rid=$(vigilnz_run_id)
+              if vigilnz_run_id_ok "$rid"; then
+                echo "Autopilot run reuse runId=$rid"
+                return 0
+              fi
+              echo "Autopilot run_id invalid ($rid) — minting a new run" >&2
+              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot run start skipped — VIGILNZ_BACKEND_URL must be broker /backend http(s) URL" >&2
+              return 0
+            fi
+            repo="${VIGILNZ_REPO_URL:-}"
+            branch="${VIGILNZ_BRANCH:-}"
+            sha="${VIGILNZ_COMMIT_SHA:-}"
+            body=$(jq -n --arg pid "$pid" --arg repo "$repo" --arg branch "$branch" --arg sha "$sha" \
+              '{pipelineId:$pid, repoUrl:(if $repo=="" then null else $repo end), branch:(if $branch=="" then null else $branch end), commitSha:(if $sha=="" then null else $sha end)}')
+            http=$(curl -sS -o /tmp/vigilnz_run_start.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/start" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            resp=$(cat /tmp/vigilnz_run_start.json 2>/dev/null || true)
+            rid=$(echo "$resp" | jq -r '.data.runId // .data.id // empty')
+            rid="$(printf '%s' "$rid" | tr -d '\r\n' | sed 's/^-n //')"
+            if vigilnz_run_id_ok "$rid"; then
+              printf '%s' "$rid" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            else
+              rid=""
+            fi
+            echo "Autopilot run start HTTP $http runId=${rid:-none}"
+            if [ "$http" != "200" ] && [ "$http" != "201" ]; then
+              echo "Autopilot run start body:" >&2
+              echo "$resp" | head -c 500 >&2 || true
+              echo >&2
+            fi
+          }
+          
+          vigilnz_run_stage() {
+            local stage status note ids rid body http
+            stage="$1"
+            status="$2"
+            note="${3-}"
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot stage heartbeat skipped — no valid run_id (stage=$stage status=$status)" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot stage heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            printf '%s' "$stage" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
+            ids=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null | xargs || true)
+            body=$(jq -n --arg stage "$stage" --arg status "$status" --arg ids "$ids" --arg note "$note" \
+              '{stage:$stage, status:$status} + (if $ids=="" then {} else {scanTargetIds: ($ids | split(" ") | map(select(. != "")))} end) + (if $note=="" then {} elif $status=="failed" then {error:$note} else {message:$note} end)')
+            http=$(curl -sS -o /tmp/vigilnz_run_stage.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/stage" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot stage HTTP $http stage=$stage status=$status runId=$rid"
+          }
+          
+          vigilnz_run_finish() {
+            local status rid body http
+            status="${1:-passed}"
+            # Idempotent: cancel/pass/fail can race with EXIT/ERR/TERM traps.
+            if [ "${VIGILNZ_FINISH_SENT:-0}" = "1" ]; then
+              echo "Autopilot finish skipped — already sent (status=$status)"
+              return 0
+            fi
+            VIGILNZ_FINISH_SENT=1
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot finish heartbeat skipped — no valid run_id" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot finish heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            body=$(jq -n --arg status "$status" '{status:$status}')
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ] && [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null), scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null)}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            fi
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ] && [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ]; then
+              body=$(jq -c --slurpfile rem ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json '. + {remediationResult: ($rem[0] // null)}' <<<"$body" 2>/dev/null || echo "$body")
+            fi
+            http=$(curl -sS -o /tmp/vigilnz_run_finish.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/finish" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot finish HTTP $http status=$status runId=$rid"
+          }
+          
+          vigilnz_run_trap() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            vigilnz_run_stage "$stage" failed "Workflow step failed"
+            vigilnz_run_finish failed
+          }
+          
+          # User / provider cancelled the job (GitHub Cancel, Harness Abort, Jenkins Stop).
+          vigilnz_run_cancel() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            echo "Autopilot run cancelled on CI provider (stage=$stage)" >&2
+            vigilnz_run_stage "$stage" failed "Cancelled on the CI provider"
+            vigilnz_run_finish cancelled
+            exit 143
+          }
+          
+          vigilnz_fail() {
+            echo "$*" >&2
+            vigilnz_run_trap
+            exit 1
+          }
+          
+          trap 'vigilnz_run_trap' ERR
+          trap 'vigilnz_run_cancel' TERM INT HUP
+          
+          
+          # Shared Auto-fix handoff (Harness / Jenkins / GitHub): Mongo result id only.
+          vigilnz_write_scan_result_id() {
+            _SID=$(printf '%s' "${1:-}" | tr -d '\r\n')
+            _PREFER="${2:-0}"
+            case "$_SID" in ''|null) return 0 ;; esac
+            if [ "$_PREFER" = "1" ] || [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id ]; then
+              printf '%s' "$_SID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id
+            fi
+            export SCAN_RESULT_ID="$_SID"
+          }
+          vigilnz_resolve_scan_result_id() {
+            _GATE_JSON=${1:-}
+            PRIOR_SCAN_RESULT_ID="${SCAN_RESULT_ID:-}"
+            SCAN_RESULT_ID=$(printf '%s' "$_GATE_JSON" | jq -r '.data.scanResultId // empty' 2>/dev/null || true)
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(tr -d '\r\n' < ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id 2>/dev/null || true)
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID="$PRIOR_SCAN_RESULT_ID"
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(jq -r '
+                (map(select((.scanType // "") == "cve" or (.scanType // "") == "sca") | .scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                as $a | if $a != "" then $a else
+                  (map(.scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                end
+              ' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json 2>/dev/null || true)
+            fi
+            SCAN_RESULT_ID=$(printf '%s' "${SCAN_RESULT_ID:-}" | tr -d '\r\n')
+            export SCAN_RESULT_ID
+          }
+          
+          
+          
+          # Selected Vigilnz repository ids: 6afbed4bafc2ca6d18b37bd3
+          # Assert repo is on the pipeline allowlist (before starting scans)
+          if [ -n "${VIGILNZ_PIPELINE_ID:-}" ]; then
+            ASSERT_BODY=$(jq -n \
+              --arg pid "$VIGILNZ_PIPELINE_ID" \
+              --arg url "$VIGILNZ_REPO_URL" \
+              '{pipelineId:$pid, repoUrl:$url}')
+            ASSERT_FILE="${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/assert.json"
+            ASSERT_HTTP=$(curl -s -o "$ASSERT_FILE" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/assert-target" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$ASSERT_BODY" || true)
+            if [ "$ASSERT_HTTP" = "401" ]; then
+              echo "Broker session rejected (HTTP 401); minting a new session" >&2
+              vigilnz_mint_broker_session || exit 1
+              ASSERT_HTTP=$(curl -s -o "$ASSERT_FILE" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/assert-target" \
+                -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+                -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+                -d "$ASSERT_BODY" || true)
+            fi
+            if [ "$ASSERT_HTTP" != "200" ]; then
+              if [ "$ASSERT_HTTP" = "401" ] || [ "$ASSERT_HTTP" = "403" ]; then
+                echo "Broker session or API auth failed for assert-target (HTTP $ASSERT_HTTP):" >&2
+              else
+                echo "Repository allowlist check failed (HTTP $ASSERT_HTTP):" >&2
+              fi
+              echo "VIGILNZ_PIPELINE_ID=${VIGILNZ_PIPELINE_ID:-}" >&2
+              cat "$ASSERT_FILE" >&2 || true
+              exit 1
+            fi
+            MATCHED_REPO_ID=$(jq -r '.data.matchedRepoId // empty' "$ASSERT_FILE")
+            MATCHED_PROJECT_ID=$(jq -r '.data.projectId // empty' "$ASSERT_FILE")
+            MATCHED_PROJECT_NAME=$(jq -r '.data.projectName // empty' "$ASSERT_FILE")
+            if [ -n "$MATCHED_REPO_ID" ] && [ "$MATCHED_REPO_ID" != "null" ]; then
+              printf '%s' "$MATCHED_REPO_ID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id
+            fi
+            if [ -n "$MATCHED_PROJECT_ID" ] && [ "$MATCHED_PROJECT_ID" != "null" ]; then
+              printf '%s' "$MATCHED_PROJECT_ID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/project_id
+            fi
+            if [ -n "$MATCHED_PROJECT_NAME" ] && [ "$MATCHED_PROJECT_NAME" != "null" ]; then
+              printf '%s' "$MATCHED_PROJECT_NAME" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/project_name
+            fi
+            echo "Repository allowlist OK (repositoryId=${MATCHED_REPO_ID:-none} projectId=${MATCHED_PROJECT_ID:-none})"
+            # Keep an in-flight Autopilot run across later stages (Harness restores run_id from
+            # prior outputs). Wiping mid-flow minted a second run — SCA/SAST stayed "Running"
+            # while IaC/gate looked Passed on a new runId.
+            _EXISTING_RUN=$(vigilnz_run_id)
+            if vigilnz_run_id_ok "$_EXISTING_RUN"; then
+              echo "Autopilot run reuse runId=$_EXISTING_RUN (targets preserved)"
+            else
+              # First stage of this CI job only — clear stale agent state, then mint.
+              : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
+              : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
+              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
+              vigilnz_run_start
+            fi
+          else
+            echo "VIGILNZ_PIPELINE_ID unset — skipping allowlist assert" >&2
+            _EXISTING_RUN=$(vigilnz_run_id)
+            if vigilnz_run_id_ok "$_EXISTING_RUN"; then
+              echo "Autopilot run reuse runId=$_EXISTING_RUN (no pipeline id; targets preserved)"
+            else
+              : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
+              : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
+              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
+              vigilnz_run_start
+            fi
+          fi
+          
+          mkdir -p "/tmp/vigilnz_ci/lanes/0"
+          for _f in token broker_session repository_id project_id project_name run_id gate.json scan_result_id scan_results.json remediate.json remediation.json; do
+            if [ -f "/tmp/vigilnz_ci/$_f" ]; then cp "/tmp/vigilnz_ci/$_f" "/tmp/vigilnz_ci/lanes/0/$_f"; fi
+          done
+          if [ -f "/tmp/vigilnz_ci/target_ids" ]; then cp "/tmp/vigilnz_ci/target_ids" "/tmp/vigilnz_ci/lanes/0/target_ids"; else : > "/tmp/vigilnz_ci/lanes/0/target_ids"; fi
+          : > "/tmp/vigilnz_ci/lanes/0/pending_target_ids"
+          
+          mkdir -p "/tmp/vigilnz_ci/lanes/1"
+          for _f in token broker_session repository_id project_id project_name run_id gate.json scan_result_id scan_results.json remediate.json remediation.json; do
+            if [ -f "/tmp/vigilnz_ci/$_f" ]; then cp "/tmp/vigilnz_ci/$_f" "/tmp/vigilnz_ci/lanes/1/$_f"; fi
+          done
+          if [ -f "/tmp/vigilnz_ci/target_ids" ]; then cp "/tmp/vigilnz_ci/target_ids" "/tmp/vigilnz_ci/lanes/1/target_ids"; else : > "/tmp/vigilnz_ci/lanes/1/target_ids"; fi
+          : > "/tmp/vigilnz_ci/lanes/1/pending_target_ids"
+          
+          mkdir -p "/tmp/vigilnz_ci/lanes/2"
+          for _f in token broker_session repository_id project_id project_name run_id gate.json scan_result_id scan_results.json remediate.json remediation.json; do
+            if [ -f "/tmp/vigilnz_ci/$_f" ]; then cp "/tmp/vigilnz_ci/$_f" "/tmp/vigilnz_ci/lanes/2/$_f"; fi
+          done
+          if [ -f "/tmp/vigilnz_ci/target_ids" ]; then cp "/tmp/vigilnz_ci/target_ids" "/tmp/vigilnz_ci/lanes/2/target_ids"; else : > "/tmp/vigilnz_ci/lanes/2/target_ids"; fi
+          : > "/tmp/vigilnz_ci/lanes/2/pending_target_ids"
+          
+          mkdir -p "/tmp/vigilnz_ci/lanes/3"
+          for _f in token broker_session repository_id project_id project_name run_id gate.json scan_result_id scan_results.json remediate.json remediation.json; do
+            if [ -f "/tmp/vigilnz_ci/$_f" ]; then cp "/tmp/vigilnz_ci/$_f" "/tmp/vigilnz_ci/lanes/3/$_f"; fi
+          done
+          if [ -f "/tmp/vigilnz_ci/target_ids" ]; then cp "/tmp/vigilnz_ci/target_ids" "/tmp/vigilnz_ci/lanes/3/target_ids"; else : > "/tmp/vigilnz_ci/lanes/3/target_ids"; fi
+          : > "/tmp/vigilnz_ci/lanes/3/pending_target_ids"
+          
+          LANE_PIDS=""
+          export VIGILNZ_AUTH_READY=1
+          if [ -s "/tmp/vigilnz_ci/broker_session" ]; then export VIGILNZ_BROKER_SESSION="$(cat "/tmp/vigilnz_ci/broker_session")"; fi
+          if [ -s "/tmp/vigilnz_ci/token" ]; then export VIGILNZ_TOKEN="$(cat "/tmp/vigilnz_ci/token")"; fi
+          (
+          set -euo pipefail
+          export VIGILNZ_STATE_DIR="/tmp/vigilnz_ci/lanes/0"
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION="${VIGILNZ_BROKER_SESSION:-}"
+          export VIGILNZ_TOKEN="${VIGILNZ_TOKEN:-}"
+          mkdir -p "$VIGILNZ_STATE_DIR"
+          # SBOM scan
           set -euo pipefail
           set +x
           : "${VIGILNZ_STATE_DIR:=/tmp/vigilnz_ci}"
@@ -447,91 +904,1739 @@ jobs:
             echo "Started $scan_type target=$target_id"
           }
           
-          
-          # Selected Vigilnz repository ids: 6afbed4bafc2ca6d18b37bd3
-          # Assert repo is on the pipeline allowlist (before starting scans)
-          if [ -n "${VIGILNZ_PIPELINE_ID:-}" ]; then
-            ASSERT_BODY=$(jq -n \
-              --arg pid "$VIGILNZ_PIPELINE_ID" \
-              --arg url "$VIGILNZ_REPO_URL" \
-              '{pipelineId:$pid, repoUrl:$url}')
-            ASSERT_FILE="${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/assert.json"
-            ASSERT_HTTP=$(curl -s -o "$ASSERT_FILE" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/assert-target" \
-              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
-              -d "$ASSERT_BODY" || true)
-            if [ "$ASSERT_HTTP" = "401" ]; then
-              echo "Broker session rejected (HTTP 401); minting a new session" >&2
-              vigilnz_mint_broker_session || exit 1
-              ASSERT_HTTP=$(curl -s -o "$ASSERT_FILE" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/assert-target" \
-                -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
-                -H "Content-Type: application/json" \
-              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
-                -d "$ASSERT_BODY" || true)
-            fi
-            if [ "$ASSERT_HTTP" != "200" ]; then
-              if [ "$ASSERT_HTTP" = "401" ] || [ "$ASSERT_HTTP" = "403" ]; then
-                echo "Broker session or API auth failed for assert-target (HTTP $ASSERT_HTTP):" >&2
-              else
-                echo "Repository allowlist check failed (HTTP $ASSERT_HTTP):" >&2
-              fi
-              echo "VIGILNZ_PIPELINE_ID=${VIGILNZ_PIPELINE_ID:-}" >&2
-              cat "$ASSERT_FILE" >&2 || true
-              exit 1
-            fi
-            MATCHED_REPO_ID=$(jq -r '.data.matchedRepoId // empty' "$ASSERT_FILE")
-            MATCHED_PROJECT_ID=$(jq -r '.data.projectId // empty' "$ASSERT_FILE")
-            MATCHED_PROJECT_NAME=$(jq -r '.data.projectName // empty' "$ASSERT_FILE")
-            if [ -n "$MATCHED_REPO_ID" ] && [ "$MATCHED_REPO_ID" != "null" ]; then
-              printf '%s' "$MATCHED_REPO_ID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id
-            fi
-            if [ -n "$MATCHED_PROJECT_ID" ] && [ "$MATCHED_PROJECT_ID" != "null" ]; then
-              printf '%s' "$MATCHED_PROJECT_ID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/project_id
-            fi
-            if [ -n "$MATCHED_PROJECT_NAME" ] && [ "$MATCHED_PROJECT_NAME" != "null" ]; then
-              printf '%s' "$MATCHED_PROJECT_NAME" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/project_name
-            fi
-            echo "Repository allowlist OK (repositoryId=${MATCHED_REPO_ID:-none} projectId=${MATCHED_PROJECT_ID:-none})"
-            # Keep an in-flight Autopilot run across later stages (Harness restores run_id from
-            # prior outputs). Wiping mid-flow minted a second run — SCA/SAST stayed "Running"
-            # while IaC/gate looked Passed on a new runId.
-            _EXISTING_RUN=$(vigilnz_run_id)
-            if vigilnz_run_id_ok "$_EXISTING_RUN"; then
-              echo "Autopilot run reuse runId=$_EXISTING_RUN (targets preserved)"
-            else
-              # First stage of this CI job only — clear stale agent state, then mint.
-              : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
-              : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
-              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
-              vigilnz_run_start
-            fi
-          else
-            echo "VIGILNZ_PIPELINE_ID unset — skipping allowlist assert" >&2
-            _EXISTING_RUN=$(vigilnz_run_id)
-            if vigilnz_run_id_ok "$_EXISTING_RUN"; then
-              echo "Autopilot run reuse runId=$_EXISTING_RUN (no pipeline id; targets preserved)"
-            else
-              : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
-              : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
-              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
-              vigilnz_run_start
-            fi
+          if [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id ]; then
+            vigilnz_fail "repository_id missing — run allowlist assert before parallel lanes"
           fi
           
-          vigilnz_run_stage cve started
+          vigilnz_run_stage sbom started
           TARGET_IDS=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null || true)
           PENDING_TARGET_IDS=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids 2>/dev/null || true)
           BEFORE_IDS=$(echo "$TARGET_IDS" | xargs)
-          vigilnz_start_scan cve '{}'
+          vigilnz_start_scan sbom '{}'
           AFTER_IDS=$(echo "$TARGET_IDS" | xargs)
           if [ -z "$AFTER_IDS" ] || [ "$AFTER_IDS" = "$BEFORE_IDS" ]; then
-            vigilnz_fail "Failed to start SCA scan"
+            vigilnz_fail "Failed to start SBOM scan"
           fi
           printf '%s' "$TARGET_IDS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
           printf '%s' "$PENDING_TARGET_IDS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
-          echo "Started SCA scan: $(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids)"
-          vigilnz_run_stage cve passed
+          echo "Started SBOM scan: $(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids)"
+          vigilnz_run_stage sbom passed
+          
+          ) &
+          LANE_PIDS="$LANE_PIDS $!"
+          (
+          set -euo pipefail
+          export VIGILNZ_STATE_DIR="/tmp/vigilnz_ci/lanes/1"
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION="${VIGILNZ_BROKER_SESSION:-}"
+          export VIGILNZ_TOKEN="${VIGILNZ_TOKEN:-}"
+          mkdir -p "$VIGILNZ_STATE_DIR"
+          # SAST scan
+          set -euo pipefail
+          set +x
+          : "${VIGILNZ_STATE_DIR:=/tmp/vigilnz_ci}"
+          mkdir -p "${VIGILNZ_STATE_DIR}" "/tmp/vigilnz_ci"
+          command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
+          if ! command -v jq >/dev/null 2>&1; then
+            JQ_BIN="/tmp/vigilnz_ci/jq"
+            if [ ! -x "$JQ_BIN" ]; then
+              curl -fsSL -o "$JQ_BIN" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 \
+                || curl -fsSL -o "$JQ_BIN" https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+              chmod +x "$JQ_BIN"
+            fi
+            export PATH="/tmp/vigilnz_ci:$PATH"
+          fi
+          command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+          
+          # Contact Backend only through the Platform Node broker (/backend/*).
+          # One broker session + one API auth per pipeline run (reuse via VIGILNZ_AUTH_READY).
+          vigilnz_first_http_url() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                http://*|https://*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          vigilnz_first_api_key() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                vigil_*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          PLATFORM_NODE_BROKER_URL="$(vigilnz_first_http_url   "${PLATFORM_NODE_BROKER_URL:-}"   "${VIGILNZ_BROKER_URL:-}"   "${vigilnz_broker_url:-}"   "${VIGILNZ_API_URL:-}" || true)"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/}"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/backend}"
+          VIGILNZ_API_KEY="$(vigilnz_first_api_key "${VIGILNZ_API_KEY:-}" "${vigilnz_api_key:-}" || true)"
+          case "${VIGILNZ_REPO_URL:-}" in ''|null|NULL|undefined) VIGILNZ_REPO_URL= ;; esac
+          case "${VIGILNZ_BRANCH:-}" in ''|null|NULL|undefined) VIGILNZ_BRANCH= ;; esac
+          VIGILNZ_REPO_URL="${VIGILNZ_REPO_URL:?Set VIGILNZ_REPO_URL to the git clone URL selected in Autopilot}"
+          VIGILNZ_PROJECT_NAME="${VIGILNZ_PROJECT_NAME:-vigilnz-ci}"
+          
+          if [ -z "$PLATFORM_NODE_BROKER_URL" ]; then
+            echo "PLATFORM_NODE_BROKER_URL must be an http(s) broker URL (never Backend, never a worker token)." >&2
+            echo "Harness: Secret Text identifier vigilnz_broker_url, bound to pipeline variable PLATFORM_NODE_BROKER_URL." >&2
+            echo "Jenkins: environment { PLATFORM_NODE_BROKER_URL = credentials('vigilnz-broker-url') } (Secret text, never Backend)." >&2
+            exit 1
+          fi
+          if [ -z "$VIGILNZ_API_KEY" ]; then
+            echo "VIGILNZ_API_KEY must start with vigil_ (Settings → API keys)." >&2
+            echo "Harness secret identifier: vigilnz_api_key. Jenkins credential id: vigilnz-api-key." >&2
+            echo "Do not use a worker node token (vwn_live_…) or a node id." >&2
+            exit 1
+          fi
+          export PLATFORM_NODE_BROKER_URL VIGILNZ_API_KEY
+          export VIGILNZ_BACKEND_URL="${PLATFORM_NODE_BROKER_URL}/backend"
+          mkdir -p "/tmp/vigilnz_ci" "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}"
+          
+          echo "PLATFORM_NODE_BROKER_URL=${PLATFORM_NODE_BROKER_URL}"
+          echo "VIGILNZ_REPO_URL=${VIGILNZ_REPO_URL}"
+          echo "VIGILNZ_PROJECT_NAME=${VIGILNZ_PROJECT_NAME}"
+          
+          vigilnz_mint_broker_session() {
+            local session_body session_http session_resp
+            session_body=$(jq -n --arg token "$VIGILNZ_API_KEY" '{token:$token}')
+            session_http=$(curl -sS -o /tmp/vigilnz_broker_session.json -w "%{http_code}" -X POST "${PLATFORM_NODE_BROKER_URL}/v1/session" \
+              -H "Content-Type: application/json" \
+              -d "$session_body" || true)
+            session_resp=$(cat /tmp/vigilnz_broker_session.json 2>/dev/null || true)
+            echo "Broker session HTTP ${session_http}"
+            if [ "$session_http" != "200" ]; then
+              echo "Broker session failed (${session_http}). Use PLATFORM_NODE_BROKER_URL, not the Backend URL. Body:" >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_BROKER_SESSION=$(echo "$session_resp" | jq -r '.sessionToken // empty')
+            if [ -z "$VIGILNZ_BROKER_SESSION" ] || [ "$VIGILNZ_BROKER_SESSION" = "null" ]; then
+              echo "Broker session JSON missing sessionToken." >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            export VIGILNZ_BROKER_SESSION
+          }
+          
+          vigilnz_api_key_auth() {
+            local auth_http auth_resp
+            AUTH_HTTP=$(curl -sS -o /tmp/vigilnz_auth.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/auth/api-key" \
+              -H "Content-Type: application/json" \
+              -H "X-Api-Key: ${VIGILNZ_API_KEY}" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "{}" || true)
+            AUTH_RESP=$(cat /tmp/vigilnz_auth.json 2>/dev/null || true)
+            echo "Auth HTTP ${AUTH_HTTP}"
+            if [ "$AUTH_HTTP" != "200" ]; then
+              echo "API key auth HTTP failed (${AUTH_HTTP}). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_TOKEN=$(echo "$AUTH_RESP" | jq -r '.access_token // .token // .data.access_token // empty')
+            if [ -z "$VIGILNZ_TOKEN" ] || [ "$VIGILNZ_TOKEN" = "null" ]; then
+              echo "API key auth failed (no token in JSON). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_TOKEN
+          }
+          
+          # One authorization per pipeline: reuse env, then AUTH_READY state files, else mint once.
+          if [ -n "${VIGILNZ_BROKER_SESSION:-}" ] && [ -n "${VIGILNZ_TOKEN:-}" ]; then
+            echo "Reusing broker session and API token for this pipeline run"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          elif [ "${VIGILNZ_AUTH_READY:-}" = "1" ] \
+            && [ -s /tmp/vigilnz_ci/broker_session ] \
+            && [ -s /tmp/vigilnz_ci/token ]; then
+            VIGILNZ_BROKER_SESSION=$(cat /tmp/vigilnz_ci/broker_session)
+            VIGILNZ_TOKEN=$(cat /tmp/vigilnz_ci/token)
+            echo "Reusing broker session and API token from pipeline state"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          else
+            # Fresh mint — do not load leftover /tmp files from a prior CI build on the agent.
+            vigilnz_mint_broker_session || exit 1
+            vigilnz_api_key_auth || exit 1
+          fi
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          
+          
+          vigilnz_run_id() {
+            # Strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            printf '%s' "$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id 2>/dev/null || true)" | tr -d '\r\n' | sed 's/^-n //'
+          }
+          
+          vigilnz_broker_backend_ok() {
+            case "${VIGILNZ_BACKEND_URL:-}" in
+              http://*|https://*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          
+          # ObjectId / UUID-like tokens only — spaces or "-n " prefixes break curl URLs.
+          vigilnz_run_id_ok() {
+            case "$1" in
+              ''|null|NULL) return 1 ;;
+              *[!A-Za-z0-9_-]*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          
+          vigilnz_run_start() {
+            local pid repo branch sha body http resp rid
+            pid="${VIGILNZ_PIPELINE_ID:-}"
+            if [ -z "$pid" ]; then
+              echo "Autopilot run start skipped — VIGILNZ_PIPELINE_ID unset (re-download Jenkinsfile after Autopilot Save)" >&2
+              return 0
+            fi
+            if [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ]; then
+              rid=$(vigilnz_run_id)
+              if vigilnz_run_id_ok "$rid"; then
+                echo "Autopilot run reuse runId=$rid"
+                return 0
+              fi
+              echo "Autopilot run_id invalid ($rid) — minting a new run" >&2
+              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot run start skipped — VIGILNZ_BACKEND_URL must be broker /backend http(s) URL" >&2
+              return 0
+            fi
+            repo="${VIGILNZ_REPO_URL:-}"
+            branch="${VIGILNZ_BRANCH:-}"
+            sha="${VIGILNZ_COMMIT_SHA:-}"
+            body=$(jq -n --arg pid "$pid" --arg repo "$repo" --arg branch "$branch" --arg sha "$sha" \
+              '{pipelineId:$pid, repoUrl:(if $repo=="" then null else $repo end), branch:(if $branch=="" then null else $branch end), commitSha:(if $sha=="" then null else $sha end)}')
+            http=$(curl -sS -o /tmp/vigilnz_run_start.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/start" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            resp=$(cat /tmp/vigilnz_run_start.json 2>/dev/null || true)
+            rid=$(echo "$resp" | jq -r '.data.runId // .data.id // empty')
+            rid="$(printf '%s' "$rid" | tr -d '\r\n' | sed 's/^-n //')"
+            if vigilnz_run_id_ok "$rid"; then
+              printf '%s' "$rid" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            else
+              rid=""
+            fi
+            echo "Autopilot run start HTTP $http runId=${rid:-none}"
+            if [ "$http" != "200" ] && [ "$http" != "201" ]; then
+              echo "Autopilot run start body:" >&2
+              echo "$resp" | head -c 500 >&2 || true
+              echo >&2
+            fi
+          }
+          
+          vigilnz_run_stage() {
+            local stage status note ids rid body http
+            stage="$1"
+            status="$2"
+            note="${3-}"
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot stage heartbeat skipped — no valid run_id (stage=$stage status=$status)" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot stage heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            printf '%s' "$stage" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
+            ids=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null | xargs || true)
+            body=$(jq -n --arg stage "$stage" --arg status "$status" --arg ids "$ids" --arg note "$note" \
+              '{stage:$stage, status:$status} + (if $ids=="" then {} else {scanTargetIds: ($ids | split(" ") | map(select(. != "")))} end) + (if $note=="" then {} elif $status=="failed" then {error:$note} else {message:$note} end)')
+            http=$(curl -sS -o /tmp/vigilnz_run_stage.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/stage" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot stage HTTP $http stage=$stage status=$status runId=$rid"
+          }
+          
+          vigilnz_run_finish() {
+            local status rid body http
+            status="${1:-passed}"
+            # Idempotent: cancel/pass/fail can race with EXIT/ERR/TERM traps.
+            if [ "${VIGILNZ_FINISH_SENT:-0}" = "1" ]; then
+              echo "Autopilot finish skipped — already sent (status=$status)"
+              return 0
+            fi
+            VIGILNZ_FINISH_SENT=1
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot finish heartbeat skipped — no valid run_id" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot finish heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            body=$(jq -n --arg status "$status" '{status:$status}')
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ] && [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null), scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null)}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            fi
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ] && [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ]; then
+              body=$(jq -c --slurpfile rem ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json '. + {remediationResult: ($rem[0] // null)}' <<<"$body" 2>/dev/null || echo "$body")
+            fi
+            http=$(curl -sS -o /tmp/vigilnz_run_finish.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/finish" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot finish HTTP $http status=$status runId=$rid"
+          }
+          
+          vigilnz_run_trap() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            vigilnz_run_stage "$stage" failed "Workflow step failed"
+            vigilnz_run_finish failed
+          }
+          
+          # User / provider cancelled the job (GitHub Cancel, Harness Abort, Jenkins Stop).
+          vigilnz_run_cancel() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            echo "Autopilot run cancelled on CI provider (stage=$stage)" >&2
+            vigilnz_run_stage "$stage" failed "Cancelled on the CI provider"
+            vigilnz_run_finish cancelled
+            exit 143
+          }
+          
+          vigilnz_fail() {
+            echo "$*" >&2
+            vigilnz_run_trap
+            exit 1
+          }
+          
+          trap 'vigilnz_run_trap' ERR
+          trap 'vigilnz_run_cancel' TERM INT HUP
+          
+          
+          # Shared Auto-fix handoff (Harness / Jenkins / GitHub): Mongo result id only.
+          vigilnz_write_scan_result_id() {
+            _SID=$(printf '%s' "${1:-}" | tr -d '\r\n')
+            _PREFER="${2:-0}"
+            case "$_SID" in ''|null) return 0 ;; esac
+            if [ "$_PREFER" = "1" ] || [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id ]; then
+              printf '%s' "$_SID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id
+            fi
+            export SCAN_RESULT_ID="$_SID"
+          }
+          vigilnz_resolve_scan_result_id() {
+            _GATE_JSON=${1:-}
+            PRIOR_SCAN_RESULT_ID="${SCAN_RESULT_ID:-}"
+            SCAN_RESULT_ID=$(printf '%s' "$_GATE_JSON" | jq -r '.data.scanResultId // empty' 2>/dev/null || true)
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(tr -d '\r\n' < ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id 2>/dev/null || true)
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID="$PRIOR_SCAN_RESULT_ID"
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(jq -r '
+                (map(select((.scanType // "") == "cve" or (.scanType // "") == "sca") | .scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                as $a | if $a != "" then $a else
+                  (map(.scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                end
+              ' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json 2>/dev/null || true)
+            fi
+            SCAN_RESULT_ID=$(printf '%s' "${SCAN_RESULT_ID:-}" | tr -d '\r\n')
+            export SCAN_RESULT_ID
+          }
+          
+          
+          
+          vigilnz_start_scan() {
+            local scan_type="$1"
+            local extra_json repo_id project_id branch repo_url create_body start_resp start_body target_id
+            extra_json="${2-}"
+            extra_json="$(printf '%s' "$extra_json" | tr -d '\r')"
+            if [ -z "$extra_json" ] || [ "$extra_json" = "null" ]; then
+              extra_json='{}'
+            fi
+            repo_id=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id 2>/dev/null || true)
+            project_id=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/project_id 2>/dev/null || true)
+            # Portable trim: strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            repo_id="$(printf '%s' "$repo_id" | tr -d '\r' | sed 's/^-n //')"
+            project_id="$(printf '%s' "$project_id" | tr -d '\r' | sed 's/^-n //')"
+            if [ -z "$repo_id" ] || [ "$repo_id" = "null" ]; then
+              repo_id="${VIGILNZ_REPOSITORY_ID:-}"
+            fi
+            if [ -z "$project_id" ] || [ "$project_id" = "null" ]; then
+              project_id="${VIGILNZ_PROJECT_ID:-}"
+            fi
+            repo_id="$(printf '%s' "$repo_id" | tr -d '\r' | sed 's/^-n //')"
+            project_id="$(printf '%s' "$project_id" | tr -d '\r' | sed 's/^-n //')"
+            branch="${VIGILNZ_BRANCH:-main}"
+            repo_url="${VIGILNZ_REPO_URL:-}"
+            case "$repo_url" in ''|null|NULL|undefined) repo_url= ;; esac
+            if [ -z "$repo_id" ] || [ "$repo_id" = "null" ]; then
+              echo "repositoryId required to start $scan_type scan — allowlist assert or VIGILNZ_REPOSITORY_ID from Autopilot Jenkinsfile" >&2
+              return 1
+            fi
+            if [ -z "$repo_url" ]; then
+              echo "VIGILNZ_REPO_URL required to start $scan_type scan (UI-baked clone URL)" >&2
+              return 1
+            fi
+            create_body=$(jq -n \
+              --arg scanType "$scan_type" \
+              --arg repositoryId "$repo_id" \
+              --arg projectId "$project_id" \
+              --arg branch "$branch" \
+              --arg repoUrl "$repo_url" \
+              --arg extraRaw "$extra_json" \
+              '(({scanType:$scanType, repositoryId:(if $repositoryId=="" then null else $repositoryId end), branch:$branch, status:"active", refType:"branch", projectId:(if $projectId=="" then null else $projectId end), scanContext:{repoUrl:$repoUrl}} + ($extraRaw | fromjson? // {})) | .scanContext = ((.scanContext // {}) + {repoUrl:$repoUrl}))')
+            start_file="${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/start_${scan_type}.json"
+            start_resp=$(curl -sS -o "$start_file" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/scan-targets/create" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$create_body" || true)
+            start_body=$(cat "$start_file" 2>/dev/null || true)
+            echo "Start $scan_type HTTP $start_resp"
+            if [ "$start_resp" = "400" ] || [ "$start_resp" = "409" ]; then
+              echo "Existing $scan_type target — creating a rescan"
+              start_resp=$(curl -sS -o "$start_file" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/scan-targets/create-rescan-target" \
+                -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+                -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+                -d "$create_body" || true)
+              start_body=$(cat "$start_file" 2>/dev/null || true)
+              echo "Rescan $scan_type HTTP $start_resp"
+            fi
+            if [ "$start_resp" != "200" ] && [ "$start_resp" != "201" ]; then
+              echo "Failed to start $scan_type scan (HTTP $start_resp): $start_body" >&2
+              return 1
+            fi
+            target_id=$(echo "$start_body" | jq -r '.details.id // .data.id // .data.targetId // .data.scanRecordId // .id // empty')
+            if [ -z "$target_id" ] || [ "$target_id" = "null" ]; then
+              echo "Failed to start $scan_type scan: $start_body" >&2
+              return 1
+            fi
+            TARGET_IDS="$TARGET_IDS $target_id"
+            PENDING_TARGET_IDS="${PENDING_TARGET_IDS:-} $target_id"
+            echo "Started $scan_type target=$target_id"
+          }
+          
+          if [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id ]; then
+            vigilnz_fail "repository_id missing — run allowlist assert before parallel lanes"
+          fi
+          
+          vigilnz_run_stage sast started
+          TARGET_IDS=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null || true)
+          PENDING_TARGET_IDS=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids 2>/dev/null || true)
+          BEFORE_IDS=$(echo "$TARGET_IDS" | xargs)
+          vigilnz_start_scan sast '{}'
+          AFTER_IDS=$(echo "$TARGET_IDS" | xargs)
+          if [ -z "$AFTER_IDS" ] || [ "$AFTER_IDS" = "$BEFORE_IDS" ]; then
+            vigilnz_fail "Failed to start SAST scan"
+          fi
+          printf '%s' "$TARGET_IDS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
+          printf '%s' "$PENDING_TARGET_IDS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
+          echo "Started SAST scan: $(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids)"
+          vigilnz_run_stage sast passed
+          
+          ) &
+          LANE_PIDS="$LANE_PIDS $!"
+          (
+          set -euo pipefail
+          export VIGILNZ_STATE_DIR="/tmp/vigilnz_ci/lanes/2"
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION="${VIGILNZ_BROKER_SESSION:-}"
+          export VIGILNZ_TOKEN="${VIGILNZ_TOKEN:-}"
+          mkdir -p "$VIGILNZ_STATE_DIR"
+          # Secret scan
+          set -euo pipefail
+          set +x
+          : "${VIGILNZ_STATE_DIR:=/tmp/vigilnz_ci}"
+          mkdir -p "${VIGILNZ_STATE_DIR}" "/tmp/vigilnz_ci"
+          command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
+          if ! command -v jq >/dev/null 2>&1; then
+            JQ_BIN="/tmp/vigilnz_ci/jq"
+            if [ ! -x "$JQ_BIN" ]; then
+              curl -fsSL -o "$JQ_BIN" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 \
+                || curl -fsSL -o "$JQ_BIN" https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+              chmod +x "$JQ_BIN"
+            fi
+            export PATH="/tmp/vigilnz_ci:$PATH"
+          fi
+          command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+          
+          # Contact Backend only through the Platform Node broker (/backend/*).
+          # One broker session + one API auth per pipeline run (reuse via VIGILNZ_AUTH_READY).
+          vigilnz_first_http_url() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                http://*|https://*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          vigilnz_first_api_key() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                vigil_*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          PLATFORM_NODE_BROKER_URL="$(vigilnz_first_http_url   "${PLATFORM_NODE_BROKER_URL:-}"   "${VIGILNZ_BROKER_URL:-}"   "${vigilnz_broker_url:-}"   "${VIGILNZ_API_URL:-}" || true)"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/}"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/backend}"
+          VIGILNZ_API_KEY="$(vigilnz_first_api_key "${VIGILNZ_API_KEY:-}" "${vigilnz_api_key:-}" || true)"
+          case "${VIGILNZ_REPO_URL:-}" in ''|null|NULL|undefined) VIGILNZ_REPO_URL= ;; esac
+          case "${VIGILNZ_BRANCH:-}" in ''|null|NULL|undefined) VIGILNZ_BRANCH= ;; esac
+          VIGILNZ_REPO_URL="${VIGILNZ_REPO_URL:?Set VIGILNZ_REPO_URL to the git clone URL selected in Autopilot}"
+          VIGILNZ_PROJECT_NAME="${VIGILNZ_PROJECT_NAME:-vigilnz-ci}"
+          
+          if [ -z "$PLATFORM_NODE_BROKER_URL" ]; then
+            echo "PLATFORM_NODE_BROKER_URL must be an http(s) broker URL (never Backend, never a worker token)." >&2
+            echo "Harness: Secret Text identifier vigilnz_broker_url, bound to pipeline variable PLATFORM_NODE_BROKER_URL." >&2
+            echo "Jenkins: environment { PLATFORM_NODE_BROKER_URL = credentials('vigilnz-broker-url') } (Secret text, never Backend)." >&2
+            exit 1
+          fi
+          if [ -z "$VIGILNZ_API_KEY" ]; then
+            echo "VIGILNZ_API_KEY must start with vigil_ (Settings → API keys)." >&2
+            echo "Harness secret identifier: vigilnz_api_key. Jenkins credential id: vigilnz-api-key." >&2
+            echo "Do not use a worker node token (vwn_live_…) or a node id." >&2
+            exit 1
+          fi
+          export PLATFORM_NODE_BROKER_URL VIGILNZ_API_KEY
+          export VIGILNZ_BACKEND_URL="${PLATFORM_NODE_BROKER_URL}/backend"
+          mkdir -p "/tmp/vigilnz_ci" "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}"
+          
+          echo "PLATFORM_NODE_BROKER_URL=${PLATFORM_NODE_BROKER_URL}"
+          echo "VIGILNZ_REPO_URL=${VIGILNZ_REPO_URL}"
+          echo "VIGILNZ_PROJECT_NAME=${VIGILNZ_PROJECT_NAME}"
+          
+          vigilnz_mint_broker_session() {
+            local session_body session_http session_resp
+            session_body=$(jq -n --arg token "$VIGILNZ_API_KEY" '{token:$token}')
+            session_http=$(curl -sS -o /tmp/vigilnz_broker_session.json -w "%{http_code}" -X POST "${PLATFORM_NODE_BROKER_URL}/v1/session" \
+              -H "Content-Type: application/json" \
+              -d "$session_body" || true)
+            session_resp=$(cat /tmp/vigilnz_broker_session.json 2>/dev/null || true)
+            echo "Broker session HTTP ${session_http}"
+            if [ "$session_http" != "200" ]; then
+              echo "Broker session failed (${session_http}). Use PLATFORM_NODE_BROKER_URL, not the Backend URL. Body:" >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_BROKER_SESSION=$(echo "$session_resp" | jq -r '.sessionToken // empty')
+            if [ -z "$VIGILNZ_BROKER_SESSION" ] || [ "$VIGILNZ_BROKER_SESSION" = "null" ]; then
+              echo "Broker session JSON missing sessionToken." >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            export VIGILNZ_BROKER_SESSION
+          }
+          
+          vigilnz_api_key_auth() {
+            local auth_http auth_resp
+            AUTH_HTTP=$(curl -sS -o /tmp/vigilnz_auth.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/auth/api-key" \
+              -H "Content-Type: application/json" \
+              -H "X-Api-Key: ${VIGILNZ_API_KEY}" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "{}" || true)
+            AUTH_RESP=$(cat /tmp/vigilnz_auth.json 2>/dev/null || true)
+            echo "Auth HTTP ${AUTH_HTTP}"
+            if [ "$AUTH_HTTP" != "200" ]; then
+              echo "API key auth HTTP failed (${AUTH_HTTP}). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_TOKEN=$(echo "$AUTH_RESP" | jq -r '.access_token // .token // .data.access_token // empty')
+            if [ -z "$VIGILNZ_TOKEN" ] || [ "$VIGILNZ_TOKEN" = "null" ]; then
+              echo "API key auth failed (no token in JSON). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_TOKEN
+          }
+          
+          # One authorization per pipeline: reuse env, then AUTH_READY state files, else mint once.
+          if [ -n "${VIGILNZ_BROKER_SESSION:-}" ] && [ -n "${VIGILNZ_TOKEN:-}" ]; then
+            echo "Reusing broker session and API token for this pipeline run"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          elif [ "${VIGILNZ_AUTH_READY:-}" = "1" ] \
+            && [ -s /tmp/vigilnz_ci/broker_session ] \
+            && [ -s /tmp/vigilnz_ci/token ]; then
+            VIGILNZ_BROKER_SESSION=$(cat /tmp/vigilnz_ci/broker_session)
+            VIGILNZ_TOKEN=$(cat /tmp/vigilnz_ci/token)
+            echo "Reusing broker session and API token from pipeline state"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          else
+            # Fresh mint — do not load leftover /tmp files from a prior CI build on the agent.
+            vigilnz_mint_broker_session || exit 1
+            vigilnz_api_key_auth || exit 1
+          fi
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          
+          
+          vigilnz_run_id() {
+            # Strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            printf '%s' "$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id 2>/dev/null || true)" | tr -d '\r\n' | sed 's/^-n //'
+          }
+          
+          vigilnz_broker_backend_ok() {
+            case "${VIGILNZ_BACKEND_URL:-}" in
+              http://*|https://*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          
+          # ObjectId / UUID-like tokens only — spaces or "-n " prefixes break curl URLs.
+          vigilnz_run_id_ok() {
+            case "$1" in
+              ''|null|NULL) return 1 ;;
+              *[!A-Za-z0-9_-]*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          
+          vigilnz_run_start() {
+            local pid repo branch sha body http resp rid
+            pid="${VIGILNZ_PIPELINE_ID:-}"
+            if [ -z "$pid" ]; then
+              echo "Autopilot run start skipped — VIGILNZ_PIPELINE_ID unset (re-download Jenkinsfile after Autopilot Save)" >&2
+              return 0
+            fi
+            if [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ]; then
+              rid=$(vigilnz_run_id)
+              if vigilnz_run_id_ok "$rid"; then
+                echo "Autopilot run reuse runId=$rid"
+                return 0
+              fi
+              echo "Autopilot run_id invalid ($rid) — minting a new run" >&2
+              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot run start skipped — VIGILNZ_BACKEND_URL must be broker /backend http(s) URL" >&2
+              return 0
+            fi
+            repo="${VIGILNZ_REPO_URL:-}"
+            branch="${VIGILNZ_BRANCH:-}"
+            sha="${VIGILNZ_COMMIT_SHA:-}"
+            body=$(jq -n --arg pid "$pid" --arg repo "$repo" --arg branch "$branch" --arg sha "$sha" \
+              '{pipelineId:$pid, repoUrl:(if $repo=="" then null else $repo end), branch:(if $branch=="" then null else $branch end), commitSha:(if $sha=="" then null else $sha end)}')
+            http=$(curl -sS -o /tmp/vigilnz_run_start.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/start" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            resp=$(cat /tmp/vigilnz_run_start.json 2>/dev/null || true)
+            rid=$(echo "$resp" | jq -r '.data.runId // .data.id // empty')
+            rid="$(printf '%s' "$rid" | tr -d '\r\n' | sed 's/^-n //')"
+            if vigilnz_run_id_ok "$rid"; then
+              printf '%s' "$rid" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            else
+              rid=""
+            fi
+            echo "Autopilot run start HTTP $http runId=${rid:-none}"
+            if [ "$http" != "200" ] && [ "$http" != "201" ]; then
+              echo "Autopilot run start body:" >&2
+              echo "$resp" | head -c 500 >&2 || true
+              echo >&2
+            fi
+          }
+          
+          vigilnz_run_stage() {
+            local stage status note ids rid body http
+            stage="$1"
+            status="$2"
+            note="${3-}"
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot stage heartbeat skipped — no valid run_id (stage=$stage status=$status)" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot stage heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            printf '%s' "$stage" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
+            ids=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null | xargs || true)
+            body=$(jq -n --arg stage "$stage" --arg status "$status" --arg ids "$ids" --arg note "$note" \
+              '{stage:$stage, status:$status} + (if $ids=="" then {} else {scanTargetIds: ($ids | split(" ") | map(select(. != "")))} end) + (if $note=="" then {} elif $status=="failed" then {error:$note} else {message:$note} end)')
+            http=$(curl -sS -o /tmp/vigilnz_run_stage.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/stage" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot stage HTTP $http stage=$stage status=$status runId=$rid"
+          }
+          
+          vigilnz_run_finish() {
+            local status rid body http
+            status="${1:-passed}"
+            # Idempotent: cancel/pass/fail can race with EXIT/ERR/TERM traps.
+            if [ "${VIGILNZ_FINISH_SENT:-0}" = "1" ]; then
+              echo "Autopilot finish skipped — already sent (status=$status)"
+              return 0
+            fi
+            VIGILNZ_FINISH_SENT=1
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot finish heartbeat skipped — no valid run_id" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot finish heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            body=$(jq -n --arg status "$status" '{status:$status}')
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ] && [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null), scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null)}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            fi
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ] && [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ]; then
+              body=$(jq -c --slurpfile rem ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json '. + {remediationResult: ($rem[0] // null)}' <<<"$body" 2>/dev/null || echo "$body")
+            fi
+            http=$(curl -sS -o /tmp/vigilnz_run_finish.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/finish" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot finish HTTP $http status=$status runId=$rid"
+          }
+          
+          vigilnz_run_trap() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            vigilnz_run_stage "$stage" failed "Workflow step failed"
+            vigilnz_run_finish failed
+          }
+          
+          # User / provider cancelled the job (GitHub Cancel, Harness Abort, Jenkins Stop).
+          vigilnz_run_cancel() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            echo "Autopilot run cancelled on CI provider (stage=$stage)" >&2
+            vigilnz_run_stage "$stage" failed "Cancelled on the CI provider"
+            vigilnz_run_finish cancelled
+            exit 143
+          }
+          
+          vigilnz_fail() {
+            echo "$*" >&2
+            vigilnz_run_trap
+            exit 1
+          }
+          
+          trap 'vigilnz_run_trap' ERR
+          trap 'vigilnz_run_cancel' TERM INT HUP
+          
+          
+          # Shared Auto-fix handoff (Harness / Jenkins / GitHub): Mongo result id only.
+          vigilnz_write_scan_result_id() {
+            _SID=$(printf '%s' "${1:-}" | tr -d '\r\n')
+            _PREFER="${2:-0}"
+            case "$_SID" in ''|null) return 0 ;; esac
+            if [ "$_PREFER" = "1" ] || [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id ]; then
+              printf '%s' "$_SID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id
+            fi
+            export SCAN_RESULT_ID="$_SID"
+          }
+          vigilnz_resolve_scan_result_id() {
+            _GATE_JSON=${1:-}
+            PRIOR_SCAN_RESULT_ID="${SCAN_RESULT_ID:-}"
+            SCAN_RESULT_ID=$(printf '%s' "$_GATE_JSON" | jq -r '.data.scanResultId // empty' 2>/dev/null || true)
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(tr -d '\r\n' < ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id 2>/dev/null || true)
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID="$PRIOR_SCAN_RESULT_ID"
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(jq -r '
+                (map(select((.scanType // "") == "cve" or (.scanType // "") == "sca") | .scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                as $a | if $a != "" then $a else
+                  (map(.scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                end
+              ' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json 2>/dev/null || true)
+            fi
+            SCAN_RESULT_ID=$(printf '%s' "${SCAN_RESULT_ID:-}" | tr -d '\r\n')
+            export SCAN_RESULT_ID
+          }
+          
+          
+          
+          vigilnz_start_scan() {
+            local scan_type="$1"
+            local extra_json repo_id project_id branch repo_url create_body start_resp start_body target_id
+            extra_json="${2-}"
+            extra_json="$(printf '%s' "$extra_json" | tr -d '\r')"
+            if [ -z "$extra_json" ] || [ "$extra_json" = "null" ]; then
+              extra_json='{}'
+            fi
+            repo_id=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id 2>/dev/null || true)
+            project_id=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/project_id 2>/dev/null || true)
+            # Portable trim: strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            repo_id="$(printf '%s' "$repo_id" | tr -d '\r' | sed 's/^-n //')"
+            project_id="$(printf '%s' "$project_id" | tr -d '\r' | sed 's/^-n //')"
+            if [ -z "$repo_id" ] || [ "$repo_id" = "null" ]; then
+              repo_id="${VIGILNZ_REPOSITORY_ID:-}"
+            fi
+            if [ -z "$project_id" ] || [ "$project_id" = "null" ]; then
+              project_id="${VIGILNZ_PROJECT_ID:-}"
+            fi
+            repo_id="$(printf '%s' "$repo_id" | tr -d '\r' | sed 's/^-n //')"
+            project_id="$(printf '%s' "$project_id" | tr -d '\r' | sed 's/^-n //')"
+            branch="${VIGILNZ_BRANCH:-main}"
+            repo_url="${VIGILNZ_REPO_URL:-}"
+            case "$repo_url" in ''|null|NULL|undefined) repo_url= ;; esac
+            if [ -z "$repo_id" ] || [ "$repo_id" = "null" ]; then
+              echo "repositoryId required to start $scan_type scan — allowlist assert or VIGILNZ_REPOSITORY_ID from Autopilot Jenkinsfile" >&2
+              return 1
+            fi
+            if [ -z "$repo_url" ]; then
+              echo "VIGILNZ_REPO_URL required to start $scan_type scan (UI-baked clone URL)" >&2
+              return 1
+            fi
+            create_body=$(jq -n \
+              --arg scanType "$scan_type" \
+              --arg repositoryId "$repo_id" \
+              --arg projectId "$project_id" \
+              --arg branch "$branch" \
+              --arg repoUrl "$repo_url" \
+              --arg extraRaw "$extra_json" \
+              '(({scanType:$scanType, repositoryId:(if $repositoryId=="" then null else $repositoryId end), branch:$branch, status:"active", refType:"branch", projectId:(if $projectId=="" then null else $projectId end), scanContext:{repoUrl:$repoUrl}} + ($extraRaw | fromjson? // {})) | .scanContext = ((.scanContext // {}) + {repoUrl:$repoUrl}))')
+            start_file="${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/start_${scan_type}.json"
+            start_resp=$(curl -sS -o "$start_file" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/scan-targets/create" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$create_body" || true)
+            start_body=$(cat "$start_file" 2>/dev/null || true)
+            echo "Start $scan_type HTTP $start_resp"
+            if [ "$start_resp" = "400" ] || [ "$start_resp" = "409" ]; then
+              echo "Existing $scan_type target — creating a rescan"
+              start_resp=$(curl -sS -o "$start_file" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/scan-targets/create-rescan-target" \
+                -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+                -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+                -d "$create_body" || true)
+              start_body=$(cat "$start_file" 2>/dev/null || true)
+              echo "Rescan $scan_type HTTP $start_resp"
+            fi
+            if [ "$start_resp" != "200" ] && [ "$start_resp" != "201" ]; then
+              echo "Failed to start $scan_type scan (HTTP $start_resp): $start_body" >&2
+              return 1
+            fi
+            target_id=$(echo "$start_body" | jq -r '.details.id // .data.id // .data.targetId // .data.scanRecordId // .id // empty')
+            if [ -z "$target_id" ] || [ "$target_id" = "null" ]; then
+              echo "Failed to start $scan_type scan: $start_body" >&2
+              return 1
+            fi
+            TARGET_IDS="$TARGET_IDS $target_id"
+            PENDING_TARGET_IDS="${PENDING_TARGET_IDS:-} $target_id"
+            echo "Started $scan_type target=$target_id"
+          }
+          
+          if [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id ]; then
+            vigilnz_fail "repository_id missing — run allowlist assert before parallel lanes"
+          fi
+          
+          vigilnz_run_stage secret started
+          TARGET_IDS=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null || true)
+          PENDING_TARGET_IDS=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids 2>/dev/null || true)
+          BEFORE_IDS=$(echo "$TARGET_IDS" | xargs)
+          vigilnz_start_scan secret '{}'
+          AFTER_IDS=$(echo "$TARGET_IDS" | xargs)
+          if [ -z "$AFTER_IDS" ] || [ "$AFTER_IDS" = "$BEFORE_IDS" ]; then
+            vigilnz_fail "Failed to start Secret scan"
+          fi
+          printf '%s' "$TARGET_IDS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
+          printf '%s' "$PENDING_TARGET_IDS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
+          echo "Started Secret scan: $(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids)"
+          vigilnz_run_stage secret passed
+          
+          ) &
+          LANE_PIDS="$LANE_PIDS $!"
+          (
+          set -euo pipefail
+          export VIGILNZ_STATE_DIR="/tmp/vigilnz_ci/lanes/3"
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION="${VIGILNZ_BROKER_SESSION:-}"
+          export VIGILNZ_TOKEN="${VIGILNZ_TOKEN:-}"
+          mkdir -p "$VIGILNZ_STATE_DIR"
+          # IaC scan
+          set -euo pipefail
+          set +x
+          : "${VIGILNZ_STATE_DIR:=/tmp/vigilnz_ci}"
+          mkdir -p "${VIGILNZ_STATE_DIR}" "/tmp/vigilnz_ci"
+          command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
+          if ! command -v jq >/dev/null 2>&1; then
+            JQ_BIN="/tmp/vigilnz_ci/jq"
+            if [ ! -x "$JQ_BIN" ]; then
+              curl -fsSL -o "$JQ_BIN" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 \
+                || curl -fsSL -o "$JQ_BIN" https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+              chmod +x "$JQ_BIN"
+            fi
+            export PATH="/tmp/vigilnz_ci:$PATH"
+          fi
+          command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+          
+          # Contact Backend only through the Platform Node broker (/backend/*).
+          # One broker session + one API auth per pipeline run (reuse via VIGILNZ_AUTH_READY).
+          vigilnz_first_http_url() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                http://*|https://*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          vigilnz_first_api_key() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                vigil_*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          PLATFORM_NODE_BROKER_URL="$(vigilnz_first_http_url   "${PLATFORM_NODE_BROKER_URL:-}"   "${VIGILNZ_BROKER_URL:-}"   "${vigilnz_broker_url:-}"   "${VIGILNZ_API_URL:-}" || true)"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/}"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/backend}"
+          VIGILNZ_API_KEY="$(vigilnz_first_api_key "${VIGILNZ_API_KEY:-}" "${vigilnz_api_key:-}" || true)"
+          case "${VIGILNZ_REPO_URL:-}" in ''|null|NULL|undefined) VIGILNZ_REPO_URL= ;; esac
+          case "${VIGILNZ_BRANCH:-}" in ''|null|NULL|undefined) VIGILNZ_BRANCH= ;; esac
+          VIGILNZ_REPO_URL="${VIGILNZ_REPO_URL:?Set VIGILNZ_REPO_URL to the git clone URL selected in Autopilot}"
+          VIGILNZ_PROJECT_NAME="${VIGILNZ_PROJECT_NAME:-vigilnz-ci}"
+          
+          if [ -z "$PLATFORM_NODE_BROKER_URL" ]; then
+            echo "PLATFORM_NODE_BROKER_URL must be an http(s) broker URL (never Backend, never a worker token)." >&2
+            echo "Harness: Secret Text identifier vigilnz_broker_url, bound to pipeline variable PLATFORM_NODE_BROKER_URL." >&2
+            echo "Jenkins: environment { PLATFORM_NODE_BROKER_URL = credentials('vigilnz-broker-url') } (Secret text, never Backend)." >&2
+            exit 1
+          fi
+          if [ -z "$VIGILNZ_API_KEY" ]; then
+            echo "VIGILNZ_API_KEY must start with vigil_ (Settings → API keys)." >&2
+            echo "Harness secret identifier: vigilnz_api_key. Jenkins credential id: vigilnz-api-key." >&2
+            echo "Do not use a worker node token (vwn_live_…) or a node id." >&2
+            exit 1
+          fi
+          export PLATFORM_NODE_BROKER_URL VIGILNZ_API_KEY
+          export VIGILNZ_BACKEND_URL="${PLATFORM_NODE_BROKER_URL}/backend"
+          mkdir -p "/tmp/vigilnz_ci" "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}"
+          
+          echo "PLATFORM_NODE_BROKER_URL=${PLATFORM_NODE_BROKER_URL}"
+          echo "VIGILNZ_REPO_URL=${VIGILNZ_REPO_URL}"
+          echo "VIGILNZ_PROJECT_NAME=${VIGILNZ_PROJECT_NAME}"
+          
+          vigilnz_mint_broker_session() {
+            local session_body session_http session_resp
+            session_body=$(jq -n --arg token "$VIGILNZ_API_KEY" '{token:$token}')
+            session_http=$(curl -sS -o /tmp/vigilnz_broker_session.json -w "%{http_code}" -X POST "${PLATFORM_NODE_BROKER_URL}/v1/session" \
+              -H "Content-Type: application/json" \
+              -d "$session_body" || true)
+            session_resp=$(cat /tmp/vigilnz_broker_session.json 2>/dev/null || true)
+            echo "Broker session HTTP ${session_http}"
+            if [ "$session_http" != "200" ]; then
+              echo "Broker session failed (${session_http}). Use PLATFORM_NODE_BROKER_URL, not the Backend URL. Body:" >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_BROKER_SESSION=$(echo "$session_resp" | jq -r '.sessionToken // empty')
+            if [ -z "$VIGILNZ_BROKER_SESSION" ] || [ "$VIGILNZ_BROKER_SESSION" = "null" ]; then
+              echo "Broker session JSON missing sessionToken." >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            export VIGILNZ_BROKER_SESSION
+          }
+          
+          vigilnz_api_key_auth() {
+            local auth_http auth_resp
+            AUTH_HTTP=$(curl -sS -o /tmp/vigilnz_auth.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/auth/api-key" \
+              -H "Content-Type: application/json" \
+              -H "X-Api-Key: ${VIGILNZ_API_KEY}" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "{}" || true)
+            AUTH_RESP=$(cat /tmp/vigilnz_auth.json 2>/dev/null || true)
+            echo "Auth HTTP ${AUTH_HTTP}"
+            if [ "$AUTH_HTTP" != "200" ]; then
+              echo "API key auth HTTP failed (${AUTH_HTTP}). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_TOKEN=$(echo "$AUTH_RESP" | jq -r '.access_token // .token // .data.access_token // empty')
+            if [ -z "$VIGILNZ_TOKEN" ] || [ "$VIGILNZ_TOKEN" = "null" ]; then
+              echo "API key auth failed (no token in JSON). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_TOKEN
+          }
+          
+          # One authorization per pipeline: reuse env, then AUTH_READY state files, else mint once.
+          if [ -n "${VIGILNZ_BROKER_SESSION:-}" ] && [ -n "${VIGILNZ_TOKEN:-}" ]; then
+            echo "Reusing broker session and API token for this pipeline run"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          elif [ "${VIGILNZ_AUTH_READY:-}" = "1" ] \
+            && [ -s /tmp/vigilnz_ci/broker_session ] \
+            && [ -s /tmp/vigilnz_ci/token ]; then
+            VIGILNZ_BROKER_SESSION=$(cat /tmp/vigilnz_ci/broker_session)
+            VIGILNZ_TOKEN=$(cat /tmp/vigilnz_ci/token)
+            echo "Reusing broker session and API token from pipeline state"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          else
+            # Fresh mint — do not load leftover /tmp files from a prior CI build on the agent.
+            vigilnz_mint_broker_session || exit 1
+            vigilnz_api_key_auth || exit 1
+          fi
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          
+          
+          vigilnz_run_id() {
+            # Strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            printf '%s' "$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id 2>/dev/null || true)" | tr -d '\r\n' | sed 's/^-n //'
+          }
+          
+          vigilnz_broker_backend_ok() {
+            case "${VIGILNZ_BACKEND_URL:-}" in
+              http://*|https://*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          
+          # ObjectId / UUID-like tokens only — spaces or "-n " prefixes break curl URLs.
+          vigilnz_run_id_ok() {
+            case "$1" in
+              ''|null|NULL) return 1 ;;
+              *[!A-Za-z0-9_-]*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          
+          vigilnz_run_start() {
+            local pid repo branch sha body http resp rid
+            pid="${VIGILNZ_PIPELINE_ID:-}"
+            if [ -z "$pid" ]; then
+              echo "Autopilot run start skipped — VIGILNZ_PIPELINE_ID unset (re-download Jenkinsfile after Autopilot Save)" >&2
+              return 0
+            fi
+            if [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ]; then
+              rid=$(vigilnz_run_id)
+              if vigilnz_run_id_ok "$rid"; then
+                echo "Autopilot run reuse runId=$rid"
+                return 0
+              fi
+              echo "Autopilot run_id invalid ($rid) — minting a new run" >&2
+              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot run start skipped — VIGILNZ_BACKEND_URL must be broker /backend http(s) URL" >&2
+              return 0
+            fi
+            repo="${VIGILNZ_REPO_URL:-}"
+            branch="${VIGILNZ_BRANCH:-}"
+            sha="${VIGILNZ_COMMIT_SHA:-}"
+            body=$(jq -n --arg pid "$pid" --arg repo "$repo" --arg branch "$branch" --arg sha "$sha" \
+              '{pipelineId:$pid, repoUrl:(if $repo=="" then null else $repo end), branch:(if $branch=="" then null else $branch end), commitSha:(if $sha=="" then null else $sha end)}')
+            http=$(curl -sS -o /tmp/vigilnz_run_start.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/start" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            resp=$(cat /tmp/vigilnz_run_start.json 2>/dev/null || true)
+            rid=$(echo "$resp" | jq -r '.data.runId // .data.id // empty')
+            rid="$(printf '%s' "$rid" | tr -d '\r\n' | sed 's/^-n //')"
+            if vigilnz_run_id_ok "$rid"; then
+              printf '%s' "$rid" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            else
+              rid=""
+            fi
+            echo "Autopilot run start HTTP $http runId=${rid:-none}"
+            if [ "$http" != "200" ] && [ "$http" != "201" ]; then
+              echo "Autopilot run start body:" >&2
+              echo "$resp" | head -c 500 >&2 || true
+              echo >&2
+            fi
+          }
+          
+          vigilnz_run_stage() {
+            local stage status note ids rid body http
+            stage="$1"
+            status="$2"
+            note="${3-}"
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot stage heartbeat skipped — no valid run_id (stage=$stage status=$status)" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot stage heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            printf '%s' "$stage" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
+            ids=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null | xargs || true)
+            body=$(jq -n --arg stage "$stage" --arg status "$status" --arg ids "$ids" --arg note "$note" \
+              '{stage:$stage, status:$status} + (if $ids=="" then {} else {scanTargetIds: ($ids | split(" ") | map(select(. != "")))} end) + (if $note=="" then {} elif $status=="failed" then {error:$note} else {message:$note} end)')
+            http=$(curl -sS -o /tmp/vigilnz_run_stage.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/stage" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot stage HTTP $http stage=$stage status=$status runId=$rid"
+          }
+          
+          vigilnz_run_finish() {
+            local status rid body http
+            status="${1:-passed}"
+            # Idempotent: cancel/pass/fail can race with EXIT/ERR/TERM traps.
+            if [ "${VIGILNZ_FINISH_SENT:-0}" = "1" ]; then
+              echo "Autopilot finish skipped — already sent (status=$status)"
+              return 0
+            fi
+            VIGILNZ_FINISH_SENT=1
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot finish heartbeat skipped — no valid run_id" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot finish heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            body=$(jq -n --arg status "$status" '{status:$status}')
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ] && [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null), scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null)}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            fi
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ] && [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ]; then
+              body=$(jq -c --slurpfile rem ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json '. + {remediationResult: ($rem[0] // null)}' <<<"$body" 2>/dev/null || echo "$body")
+            fi
+            http=$(curl -sS -o /tmp/vigilnz_run_finish.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/finish" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot finish HTTP $http status=$status runId=$rid"
+          }
+          
+          vigilnz_run_trap() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            vigilnz_run_stage "$stage" failed "Workflow step failed"
+            vigilnz_run_finish failed
+          }
+          
+          # User / provider cancelled the job (GitHub Cancel, Harness Abort, Jenkins Stop).
+          vigilnz_run_cancel() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            echo "Autopilot run cancelled on CI provider (stage=$stage)" >&2
+            vigilnz_run_stage "$stage" failed "Cancelled on the CI provider"
+            vigilnz_run_finish cancelled
+            exit 143
+          }
+          
+          vigilnz_fail() {
+            echo "$*" >&2
+            vigilnz_run_trap
+            exit 1
+          }
+          
+          trap 'vigilnz_run_trap' ERR
+          trap 'vigilnz_run_cancel' TERM INT HUP
+          
+          
+          # Shared Auto-fix handoff (Harness / Jenkins / GitHub): Mongo result id only.
+          vigilnz_write_scan_result_id() {
+            _SID=$(printf '%s' "${1:-}" | tr -d '\r\n')
+            _PREFER="${2:-0}"
+            case "$_SID" in ''|null) return 0 ;; esac
+            if [ "$_PREFER" = "1" ] || [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id ]; then
+              printf '%s' "$_SID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id
+            fi
+            export SCAN_RESULT_ID="$_SID"
+          }
+          vigilnz_resolve_scan_result_id() {
+            _GATE_JSON=${1:-}
+            PRIOR_SCAN_RESULT_ID="${SCAN_RESULT_ID:-}"
+            SCAN_RESULT_ID=$(printf '%s' "$_GATE_JSON" | jq -r '.data.scanResultId // empty' 2>/dev/null || true)
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(tr -d '\r\n' < ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id 2>/dev/null || true)
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID="$PRIOR_SCAN_RESULT_ID"
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(jq -r '
+                (map(select((.scanType // "") == "cve" or (.scanType // "") == "sca") | .scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                as $a | if $a != "" then $a else
+                  (map(.scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                end
+              ' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json 2>/dev/null || true)
+            fi
+            SCAN_RESULT_ID=$(printf '%s' "${SCAN_RESULT_ID:-}" | tr -d '\r\n')
+            export SCAN_RESULT_ID
+          }
+          
+          
+          
+          vigilnz_start_scan() {
+            local scan_type="$1"
+            local extra_json repo_id project_id branch repo_url create_body start_resp start_body target_id
+            extra_json="${2-}"
+            extra_json="$(printf '%s' "$extra_json" | tr -d '\r')"
+            if [ -z "$extra_json" ] || [ "$extra_json" = "null" ]; then
+              extra_json='{}'
+            fi
+            repo_id=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id 2>/dev/null || true)
+            project_id=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/project_id 2>/dev/null || true)
+            # Portable trim: strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            repo_id="$(printf '%s' "$repo_id" | tr -d '\r' | sed 's/^-n //')"
+            project_id="$(printf '%s' "$project_id" | tr -d '\r' | sed 's/^-n //')"
+            if [ -z "$repo_id" ] || [ "$repo_id" = "null" ]; then
+              repo_id="${VIGILNZ_REPOSITORY_ID:-}"
+            fi
+            if [ -z "$project_id" ] || [ "$project_id" = "null" ]; then
+              project_id="${VIGILNZ_PROJECT_ID:-}"
+            fi
+            repo_id="$(printf '%s' "$repo_id" | tr -d '\r' | sed 's/^-n //')"
+            project_id="$(printf '%s' "$project_id" | tr -d '\r' | sed 's/^-n //')"
+            branch="${VIGILNZ_BRANCH:-main}"
+            repo_url="${VIGILNZ_REPO_URL:-}"
+            case "$repo_url" in ''|null|NULL|undefined) repo_url= ;; esac
+            if [ -z "$repo_id" ] || [ "$repo_id" = "null" ]; then
+              echo "repositoryId required to start $scan_type scan — allowlist assert or VIGILNZ_REPOSITORY_ID from Autopilot Jenkinsfile" >&2
+              return 1
+            fi
+            if [ -z "$repo_url" ]; then
+              echo "VIGILNZ_REPO_URL required to start $scan_type scan (UI-baked clone URL)" >&2
+              return 1
+            fi
+            create_body=$(jq -n \
+              --arg scanType "$scan_type" \
+              --arg repositoryId "$repo_id" \
+              --arg projectId "$project_id" \
+              --arg branch "$branch" \
+              --arg repoUrl "$repo_url" \
+              --arg extraRaw "$extra_json" \
+              '(({scanType:$scanType, repositoryId:(if $repositoryId=="" then null else $repositoryId end), branch:$branch, status:"active", refType:"branch", projectId:(if $projectId=="" then null else $projectId end), scanContext:{repoUrl:$repoUrl}} + ($extraRaw | fromjson? // {})) | .scanContext = ((.scanContext // {}) + {repoUrl:$repoUrl}))')
+            start_file="${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/start_${scan_type}.json"
+            start_resp=$(curl -sS -o "$start_file" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/scan-targets/create" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$create_body" || true)
+            start_body=$(cat "$start_file" 2>/dev/null || true)
+            echo "Start $scan_type HTTP $start_resp"
+            if [ "$start_resp" = "400" ] || [ "$start_resp" = "409" ]; then
+              echo "Existing $scan_type target — creating a rescan"
+              start_resp=$(curl -sS -o "$start_file" -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/scan-targets/create-rescan-target" \
+                -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+                -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+                -d "$create_body" || true)
+              start_body=$(cat "$start_file" 2>/dev/null || true)
+              echo "Rescan $scan_type HTTP $start_resp"
+            fi
+            if [ "$start_resp" != "200" ] && [ "$start_resp" != "201" ]; then
+              echo "Failed to start $scan_type scan (HTTP $start_resp): $start_body" >&2
+              return 1
+            fi
+            target_id=$(echo "$start_body" | jq -r '.details.id // .data.id // .data.targetId // .data.scanRecordId // .id // empty')
+            if [ -z "$target_id" ] || [ "$target_id" = "null" ]; then
+              echo "Failed to start $scan_type scan: $start_body" >&2
+              return 1
+            fi
+            TARGET_IDS="$TARGET_IDS $target_id"
+            PENDING_TARGET_IDS="${PENDING_TARGET_IDS:-} $target_id"
+            echo "Started $scan_type target=$target_id"
+          }
+          
+          if [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/repository_id ]; then
+            vigilnz_fail "repository_id missing — run allowlist assert before parallel lanes"
+          fi
+          
+          vigilnz_run_stage iac started
+          TARGET_IDS=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null || true)
+          PENDING_TARGET_IDS=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids 2>/dev/null || true)
+          BEFORE_IDS=$(echo "$TARGET_IDS" | xargs)
+          vigilnz_start_scan iac '{}'
+          AFTER_IDS=$(echo "$TARGET_IDS" | xargs)
+          if [ -z "$AFTER_IDS" ] || [ "$AFTER_IDS" = "$BEFORE_IDS" ]; then
+            vigilnz_fail "Failed to start IaC scan"
+          fi
+          printf '%s' "$TARGET_IDS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
+          printf '%s' "$PENDING_TARGET_IDS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
+          echo "Started IaC scan: $(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids)"
+          vigilnz_run_stage iac passed
+          
+          ) &
+          LANE_PIDS="$LANE_PIDS $!"
+          LANE_FAIL=0
+          for _pid in $LANE_PIDS; do
+            if ! wait "$_pid"; then
+              LANE_FAIL=1
+            fi
+          done
+          if [ "$LANE_FAIL" != "0" ]; then
+            echo "One or more parallel lanes failed" >&2
+            exit 1
+          fi
+          
+          # --- Join 1 ---
+          set -euo pipefail
+          set +x
+          : "${VIGILNZ_STATE_DIR:=/tmp/vigilnz_ci}"
+          mkdir -p "${VIGILNZ_STATE_DIR}" "/tmp/vigilnz_ci"
+          command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
+          if ! command -v jq >/dev/null 2>&1; then
+            JQ_BIN="/tmp/vigilnz_ci/jq"
+            if [ ! -x "$JQ_BIN" ]; then
+              curl -fsSL -o "$JQ_BIN" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 \
+                || curl -fsSL -o "$JQ_BIN" https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+              chmod +x "$JQ_BIN"
+            fi
+            export PATH="/tmp/vigilnz_ci:$PATH"
+          fi
+          command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+          
+          # Contact Backend only through the Platform Node broker (/backend/*).
+          # One broker session + one API auth per pipeline run (reuse via VIGILNZ_AUTH_READY).
+          vigilnz_first_http_url() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                http://*|https://*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          vigilnz_first_api_key() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                vigil_*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          PLATFORM_NODE_BROKER_URL="$(vigilnz_first_http_url   "${PLATFORM_NODE_BROKER_URL:-}"   "${VIGILNZ_BROKER_URL:-}"   "${vigilnz_broker_url:-}"   "${VIGILNZ_API_URL:-}" || true)"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/}"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/backend}"
+          VIGILNZ_API_KEY="$(vigilnz_first_api_key "${VIGILNZ_API_KEY:-}" "${vigilnz_api_key:-}" || true)"
+          case "${VIGILNZ_REPO_URL:-}" in ''|null|NULL|undefined) VIGILNZ_REPO_URL= ;; esac
+          case "${VIGILNZ_BRANCH:-}" in ''|null|NULL|undefined) VIGILNZ_BRANCH= ;; esac
+          VIGILNZ_REPO_URL="${VIGILNZ_REPO_URL:?Set VIGILNZ_REPO_URL to the git clone URL selected in Autopilot}"
+          VIGILNZ_PROJECT_NAME="${VIGILNZ_PROJECT_NAME:-vigilnz-ci}"
+          
+          if [ -z "$PLATFORM_NODE_BROKER_URL" ]; then
+            echo "PLATFORM_NODE_BROKER_URL must be an http(s) broker URL (never Backend, never a worker token)." >&2
+            echo "Harness: Secret Text identifier vigilnz_broker_url, bound to pipeline variable PLATFORM_NODE_BROKER_URL." >&2
+            echo "Jenkins: environment { PLATFORM_NODE_BROKER_URL = credentials('vigilnz-broker-url') } (Secret text, never Backend)." >&2
+            exit 1
+          fi
+          if [ -z "$VIGILNZ_API_KEY" ]; then
+            echo "VIGILNZ_API_KEY must start with vigil_ (Settings → API keys)." >&2
+            echo "Harness secret identifier: vigilnz_api_key. Jenkins credential id: vigilnz-api-key." >&2
+            echo "Do not use a worker node token (vwn_live_…) or a node id." >&2
+            exit 1
+          fi
+          export PLATFORM_NODE_BROKER_URL VIGILNZ_API_KEY
+          export VIGILNZ_BACKEND_URL="${PLATFORM_NODE_BROKER_URL}/backend"
+          mkdir -p "/tmp/vigilnz_ci" "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}"
+          
+          echo "PLATFORM_NODE_BROKER_URL=${PLATFORM_NODE_BROKER_URL}"
+          echo "VIGILNZ_REPO_URL=${VIGILNZ_REPO_URL}"
+          echo "VIGILNZ_PROJECT_NAME=${VIGILNZ_PROJECT_NAME}"
+          
+          vigilnz_mint_broker_session() {
+            local session_body session_http session_resp
+            session_body=$(jq -n --arg token "$VIGILNZ_API_KEY" '{token:$token}')
+            session_http=$(curl -sS -o /tmp/vigilnz_broker_session.json -w "%{http_code}" -X POST "${PLATFORM_NODE_BROKER_URL}/v1/session" \
+              -H "Content-Type: application/json" \
+              -d "$session_body" || true)
+            session_resp=$(cat /tmp/vigilnz_broker_session.json 2>/dev/null || true)
+            echo "Broker session HTTP ${session_http}"
+            if [ "$session_http" != "200" ]; then
+              echo "Broker session failed (${session_http}). Use PLATFORM_NODE_BROKER_URL, not the Backend URL. Body:" >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_BROKER_SESSION=$(echo "$session_resp" | jq -r '.sessionToken // empty')
+            if [ -z "$VIGILNZ_BROKER_SESSION" ] || [ "$VIGILNZ_BROKER_SESSION" = "null" ]; then
+              echo "Broker session JSON missing sessionToken." >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            export VIGILNZ_BROKER_SESSION
+          }
+          
+          vigilnz_api_key_auth() {
+            local auth_http auth_resp
+            AUTH_HTTP=$(curl -sS -o /tmp/vigilnz_auth.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/auth/api-key" \
+              -H "Content-Type: application/json" \
+              -H "X-Api-Key: ${VIGILNZ_API_KEY}" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "{}" || true)
+            AUTH_RESP=$(cat /tmp/vigilnz_auth.json 2>/dev/null || true)
+            echo "Auth HTTP ${AUTH_HTTP}"
+            if [ "$AUTH_HTTP" != "200" ]; then
+              echo "API key auth HTTP failed (${AUTH_HTTP}). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_TOKEN=$(echo "$AUTH_RESP" | jq -r '.access_token // .token // .data.access_token // empty')
+            if [ -z "$VIGILNZ_TOKEN" ] || [ "$VIGILNZ_TOKEN" = "null" ]; then
+              echo "API key auth failed (no token in JSON). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_TOKEN
+          }
+          
+          # One authorization per pipeline: reuse env, then AUTH_READY state files, else mint once.
+          if [ -n "${VIGILNZ_BROKER_SESSION:-}" ] && [ -n "${VIGILNZ_TOKEN:-}" ]; then
+            echo "Reusing broker session and API token for this pipeline run"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          elif [ "${VIGILNZ_AUTH_READY:-}" = "1" ] \
+            && [ -s /tmp/vigilnz_ci/broker_session ] \
+            && [ -s /tmp/vigilnz_ci/token ]; then
+            VIGILNZ_BROKER_SESSION=$(cat /tmp/vigilnz_ci/broker_session)
+            VIGILNZ_TOKEN=$(cat /tmp/vigilnz_ci/token)
+            echo "Reusing broker session and API token from pipeline state"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          else
+            # Fresh mint — do not load leftover /tmp files from a prior CI build on the agent.
+            vigilnz_mint_broker_session || exit 1
+            vigilnz_api_key_auth || exit 1
+          fi
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          
+          
+          vigilnz_run_id() {
+            # Strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            printf '%s' "$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id 2>/dev/null || true)" | tr -d '\r\n' | sed 's/^-n //'
+          }
+          
+          vigilnz_broker_backend_ok() {
+            case "${VIGILNZ_BACKEND_URL:-}" in
+              http://*|https://*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          
+          # ObjectId / UUID-like tokens only — spaces or "-n " prefixes break curl URLs.
+          vigilnz_run_id_ok() {
+            case "$1" in
+              ''|null|NULL) return 1 ;;
+              *[!A-Za-z0-9_-]*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          
+          vigilnz_run_start() {
+            local pid repo branch sha body http resp rid
+            pid="${VIGILNZ_PIPELINE_ID:-}"
+            if [ -z "$pid" ]; then
+              echo "Autopilot run start skipped — VIGILNZ_PIPELINE_ID unset (re-download Jenkinsfile after Autopilot Save)" >&2
+              return 0
+            fi
+            if [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ]; then
+              rid=$(vigilnz_run_id)
+              if vigilnz_run_id_ok "$rid"; then
+                echo "Autopilot run reuse runId=$rid"
+                return 0
+              fi
+              echo "Autopilot run_id invalid ($rid) — minting a new run" >&2
+              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot run start skipped — VIGILNZ_BACKEND_URL must be broker /backend http(s) URL" >&2
+              return 0
+            fi
+            repo="${VIGILNZ_REPO_URL:-}"
+            branch="${VIGILNZ_BRANCH:-}"
+            sha="${VIGILNZ_COMMIT_SHA:-}"
+            body=$(jq -n --arg pid "$pid" --arg repo "$repo" --arg branch "$branch" --arg sha "$sha" \
+              '{pipelineId:$pid, repoUrl:(if $repo=="" then null else $repo end), branch:(if $branch=="" then null else $branch end), commitSha:(if $sha=="" then null else $sha end)}')
+            http=$(curl -sS -o /tmp/vigilnz_run_start.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/start" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            resp=$(cat /tmp/vigilnz_run_start.json 2>/dev/null || true)
+            rid=$(echo "$resp" | jq -r '.data.runId // .data.id // empty')
+            rid="$(printf '%s' "$rid" | tr -d '\r\n' | sed 's/^-n //')"
+            if vigilnz_run_id_ok "$rid"; then
+              printf '%s' "$rid" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            else
+              rid=""
+            fi
+            echo "Autopilot run start HTTP $http runId=${rid:-none}"
+            if [ "$http" != "200" ] && [ "$http" != "201" ]; then
+              echo "Autopilot run start body:" >&2
+              echo "$resp" | head -c 500 >&2 || true
+              echo >&2
+            fi
+          }
+          
+          vigilnz_run_stage() {
+            local stage status note ids rid body http
+            stage="$1"
+            status="$2"
+            note="${3-}"
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot stage heartbeat skipped — no valid run_id (stage=$stage status=$status)" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot stage heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            printf '%s' "$stage" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
+            ids=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null | xargs || true)
+            body=$(jq -n --arg stage "$stage" --arg status "$status" --arg ids "$ids" --arg note "$note" \
+              '{stage:$stage, status:$status} + (if $ids=="" then {} else {scanTargetIds: ($ids | split(" ") | map(select(. != "")))} end) + (if $note=="" then {} elif $status=="failed" then {error:$note} else {message:$note} end)')
+            http=$(curl -sS -o /tmp/vigilnz_run_stage.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/stage" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot stage HTTP $http stage=$stage status=$status runId=$rid"
+          }
+          
+          vigilnz_run_finish() {
+            local status rid body http
+            status="${1:-passed}"
+            # Idempotent: cancel/pass/fail can race with EXIT/ERR/TERM traps.
+            if [ "${VIGILNZ_FINISH_SENT:-0}" = "1" ]; then
+              echo "Autopilot finish skipped — already sent (status=$status)"
+              return 0
+            fi
+            VIGILNZ_FINISH_SENT=1
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot finish heartbeat skipped — no valid run_id" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot finish heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            body=$(jq -n --arg status "$status" '{status:$status}')
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ] && [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null), scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null)}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            fi
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ] && [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ]; then
+              body=$(jq -c --slurpfile rem ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json '. + {remediationResult: ($rem[0] // null)}' <<<"$body" 2>/dev/null || echo "$body")
+            fi
+            http=$(curl -sS -o /tmp/vigilnz_run_finish.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/finish" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot finish HTTP $http status=$status runId=$rid"
+          }
+          
+          vigilnz_run_trap() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            vigilnz_run_stage "$stage" failed "Workflow step failed"
+            vigilnz_run_finish failed
+          }
+          
+          # User / provider cancelled the job (GitHub Cancel, Harness Abort, Jenkins Stop).
+          vigilnz_run_cancel() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            echo "Autopilot run cancelled on CI provider (stage=$stage)" >&2
+            vigilnz_run_stage "$stage" failed "Cancelled on the CI provider"
+            vigilnz_run_finish cancelled
+            exit 143
+          }
+          
+          vigilnz_fail() {
+            echo "$*" >&2
+            vigilnz_run_trap
+            exit 1
+          }
+          
+          trap 'vigilnz_run_trap' ERR
+          trap 'vigilnz_run_cancel' TERM INT HUP
+          
+          
+          # Shared Auto-fix handoff (Harness / Jenkins / GitHub): Mongo result id only.
+          vigilnz_write_scan_result_id() {
+            _SID=$(printf '%s' "${1:-}" | tr -d '\r\n')
+            _PREFER="${2:-0}"
+            case "$_SID" in ''|null) return 0 ;; esac
+            if [ "$_PREFER" = "1" ] || [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id ]; then
+              printf '%s' "$_SID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id
+            fi
+            export SCAN_RESULT_ID="$_SID"
+          }
+          vigilnz_resolve_scan_result_id() {
+            _GATE_JSON=${1:-}
+            PRIOR_SCAN_RESULT_ID="${SCAN_RESULT_ID:-}"
+            SCAN_RESULT_ID=$(printf '%s' "$_GATE_JSON" | jq -r '.data.scanResultId // empty' 2>/dev/null || true)
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(tr -d '\r\n' < ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id 2>/dev/null || true)
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID="$PRIOR_SCAN_RESULT_ID"
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(jq -r '
+                (map(select((.scanType // "") == "cve" or (.scanType // "") == "sca") | .scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                as $a | if $a != "" then $a else
+                  (map(.scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                end
+              ' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json 2>/dev/null || true)
+            fi
+            SCAN_RESULT_ID=$(printf '%s' "${SCAN_RESULT_ID:-}" | tr -d '\r\n')
+            export SCAN_RESULT_ID
+          }
+          
+          
+          MERGED_TARGETS=""
+          MERGED_PENDING=""
+          for i in $(seq 0 $((4 - 1))); do
+            L="/tmp/vigilnz_ci/lanes/$i"
+            if [ -f "$L/target_ids" ]; then
+              MERGED_TARGETS="$MERGED_TARGETS $(cat "$L/target_ids")"
+            fi
+            if [ -f "$L/pending_target_ids" ]; then
+              MERGED_PENDING="$MERGED_PENDING $(cat "$L/pending_target_ids")"
+            fi
+            if [ -f "$L/gate.json" ]; then
+              SCAN_TYPE=$(jq -r '.data.scanType // empty' "$L/gate.json" 2>/dev/null || true)
+              if [ ! -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ] || [ "$SCAN_TYPE" = "cve" ] || [ "$SCAN_TYPE" = "sca" ]; then
+                cp "$L/gate.json" ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json
+              fi
+            fi
+            if [ -f "$L/scan_result_id" ]; then
+              SCAN_TYPE=$(jq -r '.data.scanType // empty' "$L/gate.json" 2>/dev/null || true)
+              _LANE_SID=$(tr -d '\r\n' < "$L/scan_result_id" 2>/dev/null || true)
+              if [ "$SCAN_TYPE" = "cve" ] || [ "$SCAN_TYPE" = "sca" ]; then
+                vigilnz_write_scan_result_id "$_LANE_SID" 1
+              else
+                vigilnz_write_scan_result_id "$_LANE_SID" 0
+              fi
+            fi
+            [ -f "$L/remediate.json" ] && cp "$L/remediate.json" ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediate.json
+            [ -f "$L/remediation.json" ] && cp "$L/remediation.json" ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json
+            if [ -f "$L/scan_results.json" ]; then
+              if [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+                cp "$L/scan_results.json" ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json
+              else
+                jq -s 'add' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json "$L/scan_results.json" > /tmp/vigilnz_scan_results_join.json 2>/dev/null \
+                  && mv /tmp/vigilnz_scan_results_join.json ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                  || true
+              fi
+            fi
+            [ -f "$L/token" ] && cp "$L/token" ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token
+            [ -f "$L/run_id" ] && cp "$L/run_id" ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+          done
+          printf '%s' "$MERGED_TARGETS" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids
+          printf '%s' "$MERGED_PENDING" | xargs > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/pending_target_ids
+          echo "Joined parallel lanes: targets=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids)"
           
           
           # --- Wait until done ---
@@ -915,6 +3020,537 @@ jobs:
           vigilnz_run_stage waitForCompletion passed
           
           
+          # --- Auto-fix and open pull request ---
+          #!/usr/bin/env bash
+          set -euo pipefail
+          set +x
+          : "${VIGILNZ_STATE_DIR:=/tmp/vigilnz_ci}"
+          mkdir -p "${VIGILNZ_STATE_DIR}" "/tmp/vigilnz_ci"
+          command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
+          if ! command -v jq >/dev/null 2>&1; then
+            JQ_BIN="/tmp/vigilnz_ci/jq"
+            if [ ! -x "$JQ_BIN" ]; then
+              curl -fsSL -o "$JQ_BIN" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 \
+                || curl -fsSL -o "$JQ_BIN" https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+              chmod +x "$JQ_BIN"
+            fi
+            export PATH="/tmp/vigilnz_ci:$PATH"
+          fi
+          command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+          
+          # Contact Backend only through the Platform Node broker (/backend/*).
+          # One broker session + one API auth per pipeline run (reuse via VIGILNZ_AUTH_READY).
+          vigilnz_first_http_url() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                http://*|https://*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          vigilnz_first_api_key() {
+            local c
+            for c in "$@"; do
+              case "$c" in
+                vigil_*) printf '%s' "$c"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+          PLATFORM_NODE_BROKER_URL="$(vigilnz_first_http_url   "${PLATFORM_NODE_BROKER_URL:-}"   "${VIGILNZ_BROKER_URL:-}"   "${vigilnz_broker_url:-}"   "${VIGILNZ_API_URL:-}" || true)"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/}"
+          PLATFORM_NODE_BROKER_URL="${PLATFORM_NODE_BROKER_URL%/backend}"
+          VIGILNZ_API_KEY="$(vigilnz_first_api_key "${VIGILNZ_API_KEY:-}" "${vigilnz_api_key:-}" || true)"
+          case "${VIGILNZ_REPO_URL:-}" in ''|null|NULL|undefined) VIGILNZ_REPO_URL= ;; esac
+          case "${VIGILNZ_BRANCH:-}" in ''|null|NULL|undefined) VIGILNZ_BRANCH= ;; esac
+          VIGILNZ_REPO_URL="${VIGILNZ_REPO_URL:?Set VIGILNZ_REPO_URL to the git clone URL selected in Autopilot}"
+          VIGILNZ_PROJECT_NAME="${VIGILNZ_PROJECT_NAME:-vigilnz-ci}"
+          
+          if [ -z "$PLATFORM_NODE_BROKER_URL" ]; then
+            echo "PLATFORM_NODE_BROKER_URL must be an http(s) broker URL (never Backend, never a worker token)." >&2
+            echo "Harness: Secret Text identifier vigilnz_broker_url, bound to pipeline variable PLATFORM_NODE_BROKER_URL." >&2
+            echo "Jenkins: environment { PLATFORM_NODE_BROKER_URL = credentials('vigilnz-broker-url') } (Secret text, never Backend)." >&2
+            exit 1
+          fi
+          if [ -z "$VIGILNZ_API_KEY" ]; then
+            echo "VIGILNZ_API_KEY must start with vigil_ (Settings → API keys)." >&2
+            echo "Harness secret identifier: vigilnz_api_key. Jenkins credential id: vigilnz-api-key." >&2
+            echo "Do not use a worker node token (vwn_live_…) or a node id." >&2
+            exit 1
+          fi
+          export PLATFORM_NODE_BROKER_URL VIGILNZ_API_KEY
+          export VIGILNZ_BACKEND_URL="${PLATFORM_NODE_BROKER_URL}/backend"
+          mkdir -p "/tmp/vigilnz_ci" "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}"
+          
+          echo "PLATFORM_NODE_BROKER_URL=${PLATFORM_NODE_BROKER_URL}"
+          echo "VIGILNZ_REPO_URL=${VIGILNZ_REPO_URL}"
+          echo "VIGILNZ_PROJECT_NAME=${VIGILNZ_PROJECT_NAME}"
+          
+          vigilnz_mint_broker_session() {
+            local session_body session_http session_resp
+            session_body=$(jq -n --arg token "$VIGILNZ_API_KEY" '{token:$token}')
+            session_http=$(curl -sS -o /tmp/vigilnz_broker_session.json -w "%{http_code}" -X POST "${PLATFORM_NODE_BROKER_URL}/v1/session" \
+              -H "Content-Type: application/json" \
+              -d "$session_body" || true)
+            session_resp=$(cat /tmp/vigilnz_broker_session.json 2>/dev/null || true)
+            echo "Broker session HTTP ${session_http}"
+            if [ "$session_http" != "200" ]; then
+              echo "Broker session failed (${session_http}). Use PLATFORM_NODE_BROKER_URL, not the Backend URL. Body:" >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_BROKER_SESSION=$(echo "$session_resp" | jq -r '.sessionToken // empty')
+            if [ -z "$VIGILNZ_BROKER_SESSION" ] || [ "$VIGILNZ_BROKER_SESSION" = "null" ]; then
+              echo "Broker session JSON missing sessionToken." >&2
+              echo "$session_resp" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            export VIGILNZ_BROKER_SESSION
+          }
+          
+          vigilnz_api_key_auth() {
+            local auth_http auth_resp
+            AUTH_HTTP=$(curl -sS -o /tmp/vigilnz_auth.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/auth/api-key" \
+              -H "Content-Type: application/json" \
+              -H "X-Api-Key: ${VIGILNZ_API_KEY}" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "{}" || true)
+            AUTH_RESP=$(cat /tmp/vigilnz_auth.json 2>/dev/null || true)
+            echo "Auth HTTP ${AUTH_HTTP}"
+            if [ "$AUTH_HTTP" != "200" ]; then
+              echo "API key auth HTTP failed (${AUTH_HTTP}). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            VIGILNZ_TOKEN=$(echo "$AUTH_RESP" | jq -r '.access_token // .token // .data.access_token // empty')
+            if [ -z "$VIGILNZ_TOKEN" ] || [ "$VIGILNZ_TOKEN" = "null" ]; then
+              echo "API key auth failed (no token in JSON). Body:" >&2
+              echo "$AUTH_RESP" | head -c 500 >&2 || true
+              echo >&2
+              return 1
+            fi
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_TOKEN
+          }
+          
+          # One authorization per pipeline: reuse env, then AUTH_READY state files, else mint once.
+          if [ -n "${VIGILNZ_BROKER_SESSION:-}" ] && [ -n "${VIGILNZ_TOKEN:-}" ]; then
+            echo "Reusing broker session and API token for this pipeline run"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > /tmp/vigilnz_ci/broker_session
+            printf '%s' "$VIGILNZ_TOKEN" > /tmp/vigilnz_ci/token
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          elif [ "${VIGILNZ_AUTH_READY:-}" = "1" ] \
+            && [ -s /tmp/vigilnz_ci/broker_session ] \
+            && [ -s /tmp/vigilnz_ci/token ]; then
+            VIGILNZ_BROKER_SESSION=$(cat /tmp/vigilnz_ci/broker_session)
+            VIGILNZ_TOKEN=$(cat /tmp/vigilnz_ci/token)
+            echo "Reusing broker session and API token from pipeline state"
+            printf '%s' "$VIGILNZ_BROKER_SESSION" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/broker_session"
+            printf '%s' "$VIGILNZ_TOKEN" > "${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/token"
+            export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          else
+            # Fresh mint — do not load leftover /tmp files from a prior CI build on the agent.
+            vigilnz_mint_broker_session || exit 1
+            vigilnz_api_key_auth || exit 1
+          fi
+          export VIGILNZ_AUTH_READY=1
+          export VIGILNZ_BROKER_SESSION VIGILNZ_TOKEN
+          
+          
+          vigilnz_run_id() {
+            # Strip CR and a leading "-n " left by non-portable BSD echo on some agents.
+            printf '%s' "$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id 2>/dev/null || true)" | tr -d '\r\n' | sed 's/^-n //'
+          }
+          
+          vigilnz_broker_backend_ok() {
+            case "${VIGILNZ_BACKEND_URL:-}" in
+              http://*|https://*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          
+          # ObjectId / UUID-like tokens only — spaces or "-n " prefixes break curl URLs.
+          vigilnz_run_id_ok() {
+            case "$1" in
+              ''|null|NULL) return 1 ;;
+              *[!A-Za-z0-9_-]*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          
+          vigilnz_run_start() {
+            local pid repo branch sha body http resp rid
+            pid="${VIGILNZ_PIPELINE_ID:-}"
+            if [ -z "$pid" ]; then
+              echo "Autopilot run start skipped — VIGILNZ_PIPELINE_ID unset (re-download Jenkinsfile after Autopilot Save)" >&2
+              return 0
+            fi
+            if [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id ]; then
+              rid=$(vigilnz_run_id)
+              if vigilnz_run_id_ok "$rid"; then
+                echo "Autopilot run reuse runId=$rid"
+                return 0
+              fi
+              echo "Autopilot run_id invalid ($rid) — minting a new run" >&2
+              rm -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot run start skipped — VIGILNZ_BACKEND_URL must be broker /backend http(s) URL" >&2
+              return 0
+            fi
+            repo="${VIGILNZ_REPO_URL:-}"
+            branch="${VIGILNZ_BRANCH:-}"
+            sha="${VIGILNZ_COMMIT_SHA:-}"
+            body=$(jq -n --arg pid "$pid" --arg repo "$repo" --arg branch "$branch" --arg sha "$sha" \
+              '{pipelineId:$pid, repoUrl:(if $repo=="" then null else $repo end), branch:(if $branch=="" then null else $branch end), commitSha:(if $sha=="" then null else $sha end)}')
+            http=$(curl -sS -o /tmp/vigilnz_run_start.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/start" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            resp=$(cat /tmp/vigilnz_run_start.json 2>/dev/null || true)
+            rid=$(echo "$resp" | jq -r '.data.runId // .data.id // empty')
+            rid="$(printf '%s' "$rid" | tr -d '\r\n' | sed 's/^-n //')"
+            if vigilnz_run_id_ok "$rid"; then
+              printf '%s' "$rid" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/run_id
+            else
+              rid=""
+            fi
+            echo "Autopilot run start HTTP $http runId=${rid:-none}"
+            if [ "$http" != "200" ] && [ "$http" != "201" ]; then
+              echo "Autopilot run start body:" >&2
+              echo "$resp" | head -c 500 >&2 || true
+              echo >&2
+            fi
+          }
+          
+          vigilnz_run_stage() {
+            local stage status note ids rid body http
+            stage="$1"
+            status="$2"
+            note="${3-}"
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot stage heartbeat skipped — no valid run_id (stage=$stage status=$status)" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot stage heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            printf '%s' "$stage" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage
+            ids=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/target_ids 2>/dev/null | xargs || true)
+            body=$(jq -n --arg stage "$stage" --arg status "$status" --arg ids "$ids" --arg note "$note" \
+              '{stage:$stage, status:$status} + (if $ids=="" then {} else {scanTargetIds: ($ids | split(" ") | map(select(. != "")))} end) + (if $note=="" then {} elif $status=="failed" then {error:$note} else {message:$note} end)')
+            http=$(curl -sS -o /tmp/vigilnz_run_stage.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/stage" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot stage HTTP $http stage=$stage status=$status runId=$rid"
+          }
+          
+          vigilnz_run_finish() {
+            local status rid body http
+            status="${1:-passed}"
+            # Idempotent: cancel/pass/fail can race with EXIT/ERR/TERM traps.
+            if [ "${VIGILNZ_FINISH_SENT:-0}" = "1" ]; then
+              echo "Autopilot finish skipped — already sent (status=$status)"
+              return 0
+            fi
+            VIGILNZ_FINISH_SENT=1
+            rid=$(vigilnz_run_id)
+            if ! vigilnz_run_id_ok "$rid"; then
+              echo "Autopilot finish heartbeat skipped — no valid run_id" >&2
+              return 0
+            fi
+            if ! vigilnz_broker_backend_ok; then
+              echo "Autopilot finish heartbeat skipped — invalid VIGILNZ_BACKEND_URL" >&2
+              return 0
+            fi
+            body=$(jq -n --arg status "$status" '{status:$status}')
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ] && [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null), scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile gate ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json \
+                '{status:$status, gateResult: ($gate[0].data // $gate[0] // null)}' 2>/dev/null || echo "$body")
+            elif [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json ]; then
+              body=$(jq -n --arg status "$status" --slurpfile scans ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json \
+                '{status:$status, scanResults: ($scans[0] // [])}' 2>/dev/null || echo "$body")
+            fi
+            if [ -f ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ] && [ -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json ]; then
+              body=$(jq -c --slurpfile rem ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json '. + {remediationResult: ($rem[0] // null)}' <<<"$body" 2>/dev/null || echo "$body")
+            fi
+            http=$(curl -sS -o /tmp/vigilnz_run_finish.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/runs/${rid}/finish" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "$body" || true)
+            echo "Autopilot finish HTTP $http status=$status runId=$rid"
+          }
+          
+          vigilnz_run_trap() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            vigilnz_run_stage "$stage" failed "Workflow step failed"
+            vigilnz_run_finish failed
+          }
+          
+          # User / provider cancelled the job (GitHub Cancel, Harness Abort, Jenkins Stop).
+          vigilnz_run_cancel() {
+            local stage
+            trap - ERR TERM INT HUP
+            stage=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/current_stage 2>/dev/null || echo scan)
+            echo "Autopilot run cancelled on CI provider (stage=$stage)" >&2
+            vigilnz_run_stage "$stage" failed "Cancelled on the CI provider"
+            vigilnz_run_finish cancelled
+            exit 143
+          }
+          
+          vigilnz_fail() {
+            echo "$*" >&2
+            vigilnz_run_trap
+            exit 1
+          }
+          
+          trap 'vigilnz_run_trap' ERR
+          trap 'vigilnz_run_cancel' TERM INT HUP
+          
+          
+          # Shared Auto-fix handoff (Harness / Jenkins / GitHub): Mongo result id only.
+          vigilnz_write_scan_result_id() {
+            _SID=$(printf '%s' "${1:-}" | tr -d '\r\n')
+            _PREFER="${2:-0}"
+            case "$_SID" in ''|null) return 0 ;; esac
+            if [ "$_PREFER" = "1" ] || [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id ]; then
+              printf '%s' "$_SID" > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id
+            fi
+            export SCAN_RESULT_ID="$_SID"
+          }
+          vigilnz_resolve_scan_result_id() {
+            _GATE_JSON=${1:-}
+            PRIOR_SCAN_RESULT_ID="${SCAN_RESULT_ID:-}"
+            SCAN_RESULT_ID=$(printf '%s' "$_GATE_JSON" | jq -r '.data.scanResultId // empty' 2>/dev/null || true)
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(tr -d '\r\n' < ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_result_id 2>/dev/null || true)
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID="$PRIOR_SCAN_RESULT_ID"
+            fi
+            if [ -z "${SCAN_RESULT_ID:-}" ] || [ "$SCAN_RESULT_ID" = "null" ]; then
+              SCAN_RESULT_ID=$(jq -r '
+                (map(select((.scanType // "") == "cve" or (.scanType // "") == "sca") | .scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                as $a | if $a != "" then $a else
+                  (map(.scanResultId // empty) | map(select(length > 0)) | .[0] // empty)
+                end
+              ' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/scan_results.json 2>/dev/null || true)
+            fi
+            SCAN_RESULT_ID=$(printf '%s' "${SCAN_RESULT_ID:-}" | tr -d '\r\n')
+            export SCAN_RESULT_ID
+          }
+          
+          
+          PR_URL=""
+          KEPT=0
+          NEEDS_HUMAN=0
+          FIX_MSG=""
+          vigilnz_run_stage autoRemediate started
+          GATE_RESP=$(cat ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/gate.json 2>/dev/null || echo '{}')
+          BRANCH="${VIGILNZ_BRANCH:-}"
+          printf '%s\n' '["main"]' > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/allowed_branches.json
+          : > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/allow_branch
+          jq -r '.[]' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/allowed_branches.json | while IFS= read -r B; do
+            if [ "$BRANCH" = "$B" ]; then
+              echo 1 > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/allow_branch
+            fi
+          done
+          if [ ! -s ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/allow_branch ]; then
+            FIX_MSG="Branch $BRANCH not in remediation allowlist; skipping auto-fix"
+            echo "$FIX_MSG"
+            jq -n --arg msg "$FIX_MSG" '{keptFixes:0,needsHuman:0,message:$msg,pullRequest:null}' > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json
+          
+          vigilnz_run_stage autoRemediate passed "${FIX_MSG}"
+          vigilnz_run_stage openPr started
+          PR_OK=0
+          case "$PR_URL" in
+            https://*|http://*)
+              case "$PR_URL" in
+                *[@[:space:]]*)
+                  echo "Auto-fix returned an unusual pull request URL: $PR_URL" >&2
+                  ;;
+                *)
+                  echo "Opened pull request: $PR_URL"
+                  PR_OK=1
+                  ;;
+              esac
+              ;;
+          esac
+          if [ "$PR_OK" != "1" ]; then
+            case "$PR_URL" in
+              */pull/*|*/pulls/*)
+                echo "Opened pull request: $PR_URL"
+                PR_OK=1
+                ;;
+            esac
+          fi
+          if [ "$PR_OK" = "1" ]; then
+            vigilnz_run_stage openPr passed "${FIX_MSG}"
+          vigilnz_run_finish passed
+          elif [ "${KEPT:-0}" != "0" ] && [ "${KEPT:-0}" != "null" ]; then
+            vigilnz_fail "Auto-fix kept changes but did not open a pull request"
+          else
+            echo "${FIX_MSG:-Auto-fix kept no package upgrades; no pull request to open}"
+            vigilnz_run_stage openPr passed "${FIX_MSG}"
+          vigilnz_run_finish passed
+          fi
+          
+          else
+            # Same resolve contract on Harness, Jenkins, and GitHub (see scanResultIdBash.js).
+            vigilnz_resolve_scan_result_id "$GATE_RESP"
+            case "$SCAN_RESULT_ID" in
+              ''|null|*[!A-Za-z0-9_-]*)
+                echo "No scanResultId for auto-fix (gate/file empty). Cannot remediate findings." >&2
+                vigilnz_fail "Auto-fix missing scanResultId — gate/wait must hand off SCAN_RESULT_ID"
+                ;;
+            esac
+            vigilnz_write_scan_result_id "$SCAN_RESULT_ID" 1
+            REM_HTTP=$(curl -sS -o ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediate.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/sca/auto-remediate" \
+              -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+              -d "{\"scanResultId\":\"$SCAN_RESULT_ID\",\"openPR\":true}" || true)
+            if [ "$REM_HTTP" != "200" ]; then
+              REM_ERR=$(jq -r '.message // .error // empty' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediate.json 2>/dev/null || true)
+              echo "Auto-fix start HTTP $REM_HTTP${REM_ERR:+: $REM_ERR}" >&2
+              vigilnz_fail "Auto-fix did not start${REM_ERR:+: $REM_ERR}"
+            fi
+            REMEDIATE_ID=$(jq -r '.data.scanTargetId // empty' ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediate.json)
+            case "$REMEDIATE_ID" in
+              ''|*[!A-Za-z0-9_-]*) vigilnz_fail "Auto-fix did not return a target id" ;;
+            esac
+            echo "Auto-fix started target=$REMEDIATE_ID scanResultId=$SCAN_RESULT_ID openPR=true"
+            MAX_POLLS=${VIGILNZ_MAX_POLLS:-270}
+            POLL=0
+            STATUS=""
+            PR_URL=""
+            KEPT=0
+            NEEDS_HUMAN=0
+            FIX_MSG=""
+            while [ $POLL -lt $MAX_POLLS ]; do
+              ST_HTTP=$(curl -sS -o /tmp/vigilnz_remediate_status.json -w "%{http_code}" \
+                -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
+              -H "x-broker-session: ${VIGILNZ_BROKER_SESSION}" \
+                "${VIGILNZ_BACKEND_URL}/sca/auto-remediate/$REMEDIATE_ID" || true)
+              if [ "$ST_HTTP" = "200" ]; then
+                STATUS=$(jq -r '.data.status // empty' /tmp/vigilnz_remediate_status.json)
+                PR_URL=$(jq -r '.data.pullRequest // empty' /tmp/vigilnz_remediate_status.json)
+                KEPT=$(jq -r '.data.fixSummary.keptFixes // 0' /tmp/vigilnz_remediate_status.json)
+                NEEDS_HUMAN=$(jq -r '.data.fixSummary.needsHuman // 0' /tmp/vigilnz_remediate_status.json)
+                FIX_MSG=$(jq -r '.data.message // .data.fixSummary.message // .data.progress.message // empty' /tmp/vigilnz_remediate_status.json)
+                echo "Auto-fix status=$STATUS kept=$KEPT needsHuman=$NEEDS_HUMAN${PR_URL:+ pr=$PR_URL}"
+                case "$STATUS" in
+                  completed|failed|cancelled) break ;;
+                esac
+                case "$PR_URL" in
+                  https://*|http://*|*/pull/*)
+                    STATUS=completed
+                    break
+                    ;;
+                esac
+              elif [ "$ST_HTTP" = "401" ] || [ "$ST_HTTP" = "403" ]; then
+                ST_ERR=$(jq -r '.message // .error // .code // empty' /tmp/vigilnz_remediate_status.json 2>/dev/null || true)
+                ST_BODY=$(head -c 400 /tmp/vigilnz_remediate_status.json 2>/dev/null || true)
+                echo "Auto-fix status HTTP $ST_HTTP${ST_ERR:+: $ST_ERR}" >&2
+                if [ -n "$ST_BODY" ]; then echo "Auto-fix status body: $ST_BODY" >&2; fi
+                vigilnz_fail "Auto-fix status denied (HTTP $ST_HTTP${ST_ERR:+: $ST_ERR})"
+              else
+                echo "Auto-fix status HTTP $ST_HTTP"
+              fi
+              POLL=$((POLL + 1))
+              sleep 10
+            done
+            if [ "$STATUS" = "failed" ] || [ "$STATUS" = "cancelled" ]; then
+              vigilnz_fail "Auto-fix ended with status=$STATUS"
+            fi
+            if [ "$STATUS" != "completed" ]; then
+              vigilnz_fail "Auto-fix did not complete (status=${STATUS:-timeout})"
+            fi
+            if [ -z "$FIX_MSG" ] || [ "$FIX_MSG" = "null" ]; then
+              if [ "${KEPT:-0}" = "0" ] && [ "${NEEDS_HUMAN:-0}" != "0" ]; then
+                FIX_MSG="No packages could be auto-fixed; $NEEDS_HUMAN finding(s) still need a human review"
+              elif [ "${KEPT:-0}" = "0" ]; then
+                FIX_MSG="No auto-fixable package upgrades were kept"
+              elif [ "${NEEDS_HUMAN:-0}" != "0" ]; then
+                FIX_MSG="Kept $KEPT auto-fix(s); $NEEDS_HUMAN finding(s) still need a human review"
+              else
+                FIX_MSG="Kept $KEPT auto-fix(s)"
+              fi
+              if [ -n "$PR_URL" ] && [ "$PR_URL" != "null" ]; then
+                FIX_MSG="$FIX_MSG; opened a pull request"
+              fi
+            fi
+            echo "Auto-fix result: $FIX_MSG"
+            KEPT_N=$(printf '%s' "${KEPT:-0}" | tr -cd '0-9')
+            HUMAN_N=$(printf '%s' "${NEEDS_HUMAN:-0}" | tr -cd '0-9')
+            : "${KEPT_N:=0}"
+            : "${HUMAN_N:=0}"
+            jq -n \
+              --argjson kept "$KEPT_N" \
+              --argjson human "$HUMAN_N" \
+              --arg msg "$FIX_MSG" \
+              --arg pr "${PR_URL:-}" \
+              '{keptFixes:$kept, needsHuman:$human, message:$msg, pullRequest:(if $pr=="" or $pr=="null" then null else $pr end)}' \
+              > ${VIGILNZ_STATE_DIR:-/tmp/vigilnz_ci}/remediation.json
+          
+          vigilnz_run_stage autoRemediate passed "${FIX_MSG}"
+          vigilnz_run_stage openPr started
+          PR_OK=0
+          case "$PR_URL" in
+            https://*|http://*)
+              case "$PR_URL" in
+                *[@[:space:]]*)
+                  echo "Auto-fix returned an unusual pull request URL: $PR_URL" >&2
+                  ;;
+                *)
+                  echo "Opened pull request: $PR_URL"
+                  PR_OK=1
+                  ;;
+              esac
+              ;;
+          esac
+          if [ "$PR_OK" != "1" ]; then
+            case "$PR_URL" in
+              */pull/*|*/pulls/*)
+                echo "Opened pull request: $PR_URL"
+                PR_OK=1
+                ;;
+            esac
+          fi
+          if [ "$PR_OK" = "1" ]; then
+            vigilnz_run_stage openPr passed "${FIX_MSG}"
+          vigilnz_run_finish passed
+          elif [ "${KEPT:-0}" != "0" ] && [ "${KEPT:-0}" != "null" ]; then
+            vigilnz_fail "Auto-fix kept changes but did not open a pull request"
+          else
+            echo "${FIX_MSG:-Auto-fix kept no package upgrades; no pull request to open}"
+            vigilnz_run_stage openPr passed "${FIX_MSG}"
+          vigilnz_run_finish passed
+          fi
+          
+          fi
+          
+          
           # --- Pipeline rules ---
           #!/usr/bin/env bash
           set -euo pipefail
@@ -1271,7 +3907,7 @@ jobs:
               --arg repoUrl "${VIGILNZ_REPO_URL:-}" \
               --arg failOn "HIGH" \
               --argjson failOnKev true \
-              --argjson softFail true \
+              --argjson softFail false \
               '{targetId:$tid, pipelineId:(if $pid=="" then null else $pid end), repoUrl:(if $repoUrl=="" then null else $repoUrl end), failOn:$failOn, failOnKev:$failOnKev, softFail:$softFail}')
             GATE_HTTP=$(curl -sS -o /tmp/vigilnz_gate_resp.json -w "%{http_code}" -X POST "${VIGILNZ_BACKEND_URL}/ci-pipelines/gate-eval" \
               -H "Authorization: Bearer ${VIGILNZ_TOKEN}" \
@@ -1319,7 +3955,6 @@ jobs:
           fi
           echo "Gate passed for all scans"
           vigilnz_run_stage gate passed
-          vigilnz_run_finish passed
           
           echo "Vigilnz CI pipeline finished OK"
           
